@@ -53,7 +53,8 @@ Sneeai Agent 默认只监听 `127.0.0.1`。网页第一次带正确 token 连接
 
 `sneeai-agent` 使用自己的 `package.json` 版本号，不跟仓库根目录 `VERSION` 绑定。推送到 `main` 后，GitHub Actions 会检查 npm 上是否已经存在当前包版本；不存在时才发布 `@sneeai/sneeai-agent`。
 
-发布前需要在 GitHub 仓库 Secrets 中配置 `NPM_TOKEN`。
+发布使用 npm Trusted Publisher 与 GitHub Actions OIDC。npm 包仅信任
+`sneeai/sneeai-agent` 仓库中的 `publish-canvas-agent.yml`，工作流不保存长期 npm Token。
 
 ## Codex MCP
 
