@@ -249,7 +249,7 @@ export function startHttpServer(openTarget?: string) {
         console.log(`Local URL: ${config.url}`);
         console.log(`Connect token: ${config.token}`);
         console.log("Codex MCP is not installed by this command.");
-        console.log("Optional MCP add: codex mcp add sneeai-agent -- npx -y @sneeai/sneeai-agent@0.3.1 mcp");
+        console.log("Optional MCP add: codex mcp add sneeai-agent -- npx -y @sneeai/sneeai-agent@0.3.2 mcp");
         console.log("Remove manually added MCP: codex mcp remove sneeai-agent");
         if (logger.enabled) console.log(`Debug log: ${logger.filePath}`);
         logger.info("Canvas Agent started", { url: config.url, workspace: ensureSiteWorkspace(config).workspacePath, debugLog: logger.filePath });

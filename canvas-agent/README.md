@@ -37,14 +37,14 @@ Connect token: xxxxxx
 使用 `open` 子命令时，Canvas Agent 会复用本机配置、启动本地服务并打开带 fragment 配对信息的画布地址：
 
 ```bash
-npx -y @sneeai/sneeai-agent@0.3.1 open "https://sneeai.com/canvas?mode=new"
+npx -y @sneeai/sneeai-agent@0.3.2 open "https://sneeai.com/canvas?mode=new"
 ```
 
 诊断本机 Node、Agent 端口和版本：
 
 ```bash
-npx -y @sneeai/sneeai-agent@0.3.1 doctor
-npx -y @sneeai/sneeai-agent@0.3.1 version
+npx -y @sneeai/sneeai-agent@0.3.2 doctor
+npx -y @sneeai/sneeai-agent@0.3.2 version
 ```
 
 Sneeai Agent 默认只监听 `127.0.0.1`。网页第一次带正确 token 连接后，Sneeai Agent 会记录该网页 Origin；之后其他 Origin 不能复用这个本地 Agent，除非用户清理 `~/.sneeai-agent/sneeai-agent.json` 里的 `origins`。
@@ -88,7 +88,7 @@ codex plugin add sneeai-agent@sneeai
 插件默认通过 npm 启动 MCP；MCP 启动前会自动拉起或复用普通本地 Agent，不会把 MCP 写入全局配置，也不会在退出时自动卸载：
 
 ```bash
-npx -y @sneeai/sneeai-agent@0.3.1 mcp
+npx -y @sneeai/sneeai-agent@0.3.2 mcp
 ```
 
 使用时可以直接在 Codex 里说“打开 Infinite Canvas”，插件会使用本地 Agent 的配对信息，在右侧打开 `https://sneeai.com/` 并自动新建、连接画布；只有明确要求使用本地项目时才会启动本地前端。
@@ -96,7 +96,7 @@ npx -y @sneeai/sneeai-agent@0.3.1 mcp
 Canvas Agent 启动后，给 Codex 添加 MCP：
 
 ```bash
-codex mcp add sneeai-agent -- npx -y @sneeai/sneeai-agent@0.3.1 mcp
+codex mcp add sneeai-agent -- npx -y @sneeai/sneeai-agent@0.3.2 mcp
 ```
 
 本仓库开发时可以改成，实际使用建议替换为本机绝对路径：
@@ -112,7 +112,7 @@ Canvas Agent 源码使用 TypeScript 编写，MCP 协议层使用官方 `@modelc
 ```toml
 [mcp_servers.sneeai-agent]
 command = "npx"
-args = ["-y", "@sneeai/sneeai-agent@0.3.1", "mcp"]
+args = ["-y", "@sneeai/sneeai-agent@0.3.2", "mcp"]
 default_tools_approval_mode = "approve"
 ```
 
@@ -165,7 +165,7 @@ Claude Code Adapter 代码暂时保留，但当前网页侧边栏只开放 Codex
 如果希望 Claude Code 也能操作画布，需要给 Claude Code 添加同一个 MCP。建议用 user scope，避免 Canvas Agent 从不同目录启动时找不到配置：
 
 ```bash
-claude mcp add --scope user --transport stdio sneeai-agent -- npx -y @sneeai/sneeai-agent@0.3.1 mcp
+claude mcp add --scope user --transport stdio sneeai-agent -- npx -y @sneeai/sneeai-agent@0.3.2 mcp
 ```
 
 本仓库开发时可以改成：

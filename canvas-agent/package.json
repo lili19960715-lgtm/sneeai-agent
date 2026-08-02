@@ -1,6 +1,6 @@
 {
   "name": "@sneeai/sneeai-agent",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -39,11 +39,11 @@
   "homepage": "https://sneeai.com/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lili19960715-lgtm/sneeai-agent.git",
+    "url": "git+https://github.com/sneeai/sneeai-agent.git",
     "directory": "canvas-agent"
   },
   "bugs": {
-    "url": "https://github.com/lili19960715-lgtm/sneeai-agent/issues"
+    "url": "https://github.com/sneeai/sneeai-agent/issues"
   },
   "publishConfig": {
     "access": "public"

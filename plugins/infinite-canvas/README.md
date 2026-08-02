@@ -7,7 +7,7 @@
 macOS / Linux：
 
 ```bash
-git clone https://github.com/lili19960715-lgtm/sneeai-agent.git
+git clone https://github.com/sneeai/sneeai-agent.git
 cd sneeai-agent
 codex plugin marketplace add "$(pwd)"
 codex plugin add sneeai-agent@sneeai
@@ -16,7 +16,7 @@ codex plugin add sneeai-agent@sneeai
 Windows PowerShell：
 
 ```powershell
-git clone https://github.com/lili19960715-lgtm/sneeai-agent.git
+git clone https://github.com/sneeai/sneeai-agent.git
 cd sneeai-agent
 codex plugin marketplace add "$PWD"
 codex plugin add sneeai-agent@sneeai

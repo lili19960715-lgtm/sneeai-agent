@@ -1,13 +1,13 @@
 {
   "name": "sneeai-agent",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Use Codex to read and operate SneeAI Canvas through the local Sneeai Agent MCP server.",
   "author": {
     "name": "SneeAI",
     "url": "https://sneeai.com/"
   },
   "homepage": "https://sneeai.com/",
-  "repository": "https://github.com/lili19960715-lgtm/sneeai-agent",
+  "repository": "https://github.com/sneeai/sneeai-agent",
   "license": "AGPL-3.0",
   "keywords": ["infinite-canvas", "canvas", "mcp", "agent"],
   "skills": "./skills/",

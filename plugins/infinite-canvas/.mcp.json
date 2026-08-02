@@ -2,7 +2,7 @@
   "mcpServers": {
     "sneeai-agent": {
       "command": "npx",
-      "args": ["-y", "@sneeai/sneeai-agent@0.3.1", "mcp"],
+      "args": ["-y", "@sneeai/sneeai-agent@0.3.2", "mcp"],
       "startup_timeout_sec": 20,
       "tool_timeout_sec": 90
     }
