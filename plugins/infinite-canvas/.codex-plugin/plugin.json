@@ -1,0 +1,32 @@
+{
+  "name": "sneeai-agent",
+  "version": "0.3.1",
+  "description": "Use Codex to read and operate SneeAI Canvas through the local Sneeai Agent MCP server.",
+  "author": {
+    "name": "SneeAI",
+    "url": "https://sneeai.com/"
+  },
+  "homepage": "https://sneeai.com/",
+  "repository": "https://github.com/lili19960715-lgtm/sneeai-agent",
+  "license": "AGPL-3.0",
+  "keywords": ["infinite-canvas", "canvas", "mcp", "agent"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Sneeai Agent",
+    "shortDescription": "Use Codex to operate the current SneeAI canvas.",
+    "longDescription": "Connects Codex to the local Sneeai Agent MCP server so Codex can inspect the current canvas, create nodes, connect flows, and trigger generation through the web canvas confirmation flow.",
+    "developerName": "SneeAI",
+    "category": "Productivity",
+    "capabilities": ["Canvas", "MCP", "Creative Workflow"],
+    "websiteURL": "https://sneeai.com/",
+    "defaultPrompt": [
+      "打开 SneeAI Canvas",
+      "读取当前画布并总结节点结构",
+      "根据选中节点创建一组生图提示词"
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png"
+  }
+}
