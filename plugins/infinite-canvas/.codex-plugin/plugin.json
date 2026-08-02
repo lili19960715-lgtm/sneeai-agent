@@ -1,6 +1,6 @@
 {
   "name": "sneeai",
-  "version": "0.1.0+codex.20260802170755",
+  "version": "0.1.0+codex.20260802173941",
   "description": "Connect Codex to a locally installed Sneeai Agent.",
   "author": {
     "name": "SneeAI",

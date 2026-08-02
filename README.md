@@ -1,6 +1,6 @@
 # Sneeai
 
-Sneeai is the Codex plugin bridge for the independently installed Sneeai Agent runtime.
+Sneeai is the Codex plugin bridge for the independently installed Sneeai Agent runtime. The plugin ships its bridge directly and does not download the Agent from npm.
 
 ## Install the Codex plugin
 
@@ -13,12 +13,15 @@ codex plugin add sneeai@sneeai
 
 On Windows PowerShell, use `$PWD` instead of `$(pwd)`.
 
-## Start the local Agent
+## Start the local Agent during development
 
 ```bash
-npx -y @sneeai/sneeai-agent open
+cd canvas-agent
+npm install
+npm run build
+npm start
 ```
 
-The Agent is downloaded and updated independently from the Codex plugin. Codex credentials stay on the user's device.
+Production users download the Agent installer from sneeai.com. The Agent is not distributed through npm and is updated independently from the Codex plugin. Codex credentials stay on the user's device.
 
 See [canvas-agent/README.md](canvas-agent/README.md) for commands and configuration.

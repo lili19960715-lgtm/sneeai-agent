@@ -4,16 +4,11 @@ Sneeai Agent is the independent local runtime for SneeAI. Users download and upd
 
 ## Start locally
 
-```bash
-npx -y @sneeai/sneeai-agent
-```
+Build and run this source checkout with `npm run build` followed by `npm start`.
 
 For diagnostics:
 
-```bash
-npx -y @sneeai/sneeai-agent doctor
-npx -y @sneeai/sneeai-agent version
-```
+After building, run `node dist/index.js doctor` or `node dist/index.js version`.
 
 The Agent stores its local configuration in `~/.sneeai-agent/sneeai-agent.json`. It never sends the user's Codex credentials to SneeAI.
 
@@ -23,7 +18,7 @@ The website discovers the loopback Agent, verifies its protocol and device ident
 
 ## Codex plugin boundary
 
-The Codex plugin is a separate package. It starts `@sneeai/sneeai-codex-bridge`, which only forwards MCP calls to this already-installed local Agent. The bridge never starts, downloads, or upgrades the Agent.
+The Codex plugin bundles its small bridge, which only forwards MCP calls to this already-installed local Agent. The bridge never starts, downloads, or upgrades the Agent.
 
 ## Development
 

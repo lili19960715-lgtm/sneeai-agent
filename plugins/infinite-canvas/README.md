@@ -19,4 +19,4 @@ Windows PowerShell uses `"$PWD"` instead of `"$(pwd)"`.
 2. Install this Codex plugin once.
 3. Open a new Codex task and say: `打开并连接 SneeAI Canvas`.
 
-The plugin does not contain the Agent runtime and does not pin an Agent version. Agent upgrades are independent. If the Agent is missing, stopped, or incompatible, the bridge reports that the user should download or update it.
+The plugin contains its small Codex bridge, but not the Agent runtime. It does not download, start, or pin an Agent version. Agent upgrades are independent. If the Agent is missing, stopped, or incompatible, the bridge reports that the user should download or update it.

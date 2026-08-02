@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "sneeai": {
-      "command": "npx",
-      "args": ["-y", "@sneeai/sneeai-codex-bridge"],
+      "command": "node",
+      "args": ["./bin/sneeai-bridge.mjs"],
+      "cwd": ".",
       "startup_timeout_sec": 20,
       "tool_timeout_sec": 90
     }

@@ -1,6 +1,7 @@
 {
-  "name": "@sneeai/sneeai-agent",
+  "name": "sneeai-agent-runtime",
   "version": "0.3.3",
+  "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -45,8 +46,5 @@
   },
   "bugs": {
     "url": "https://github.com/sneeai/sneeai-agent/issues"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }

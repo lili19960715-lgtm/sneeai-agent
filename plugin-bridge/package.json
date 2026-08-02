@@ -1,7 +1,7 @@
 {
-  "name": "@sneeai/sneeai-codex-bridge",
+  "name": "sneeai-codex-bridge-source",
   "version": "0.1.0",
-  "private": false,
+  "private": true,
   "type": "module",
   "bin": {
     "sneeai-codex-bridge": "dist/index.js"
@@ -30,8 +30,5 @@
     "type": "git",
     "url": "git+https://github.com/sneeai/sneeai-agent.git",
     "directory": "plugin-bridge"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }
