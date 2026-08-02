@@ -1,0 +1,20 @@
+{
+  "name": "sneeai",
+  "interface": {
+    "displayName": "Sneeai Agent"
+  },
+  "plugins": [
+    {
+      "name": "sneeai-agent",
+      "source": {
+        "source": "local",
+        "path": "./plugins/infinite-canvas"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
