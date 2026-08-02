@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 
 import { AGENT_PROMPT } from "../config.js";
+import { redactSensitiveText } from "../utils/logger.js";
 import { errorMessage } from "../utils/value.js";
 import type { AgentEmit } from "./types.js";
 
-/** 使用 Claude CLI 执行一次带 Canvas Agent 工具的任务。 */
+/** 使用 Claude CLI 执行一次带 Sneeai Agent 工具的任务。 */
 export function runClaudeTurn(prompt: string, emit: AgentEmit) {
     const fullPrompt = withAgentPrompt(prompt);
     if (!fullPrompt) return;
@@ -12,7 +13,7 @@ export function runClaudeTurn(prompt: string, emit: AgentEmit) {
     if (child) pipeJsonLines(child, emit, "claude");
 }
 
-/** 为 Claude CLI 请求拼接 Canvas Agent 指令。 */
+/** 为 Claude CLI 请求拼接 Sneeai Agent 指令。 */
 function withAgentPrompt(prompt: string) {
     return prompt.trim() ? `${AGENT_PROMPT}\n\n用户请求：${prompt}` : "";
 }
@@ -32,8 +33,8 @@ function pipeJsonLines(child: ReturnType<typeof spawn>, emit: AgentEmit, agent: 
             }
         });
     });
-    child.stderr?.on("data", (chunk) => emit("agent_log", { text: chunk.toString() }));
-    child.on("error", (error) => emit("agent_error", { message: error.message }));
+    child.stderr?.on("data", (chunk) => emit("agent_log", { text: redactSensitiveText(chunk.toString()) }));
+    child.on("error", () => emit("agent_error", { message: "Claude Agent 进程异常" }));
     child.on("close", (code) => emit("agent_done", { agent, code }));
 }
 
@@ -42,7 +43,7 @@ function spawnAgent(name: string, args: string[], emit: AgentEmit) {
     try {
         return spawn(name, args, { stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32", windowsHide: true });
     } catch (error) {
-        emit("agent_error", { message: errorMessage(error) });
+        emit("agent_error", { message: redactSensitiveText(errorMessage(error)) });
         return null;
     }
 }

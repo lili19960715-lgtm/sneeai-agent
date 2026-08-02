@@ -3,7 +3,8 @@ import type { ServerResponse } from "node:http";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CanvasSession } from "./session.js";
+import { CanvasSession, READ_ONLY_TOOL_NAMES, type PendingToolProposal } from "./session.js";
+import { toolInputSchemas } from "./schemas.js";
 
 test("MCP 读取当前激活网页的画布", async (t) => {
     const session = new CanvasSession();
@@ -36,9 +37,30 @@ test("画布写操作只发送给当前激活网页", async (t) => {
     session.activateClient("second");
 
     const result = session.callTool("canvas_create_text_node", { text: "只写入第二个画布" });
+    const proposal = second.event("tool_proposal");
+    assert.equal(first.event("tool_proposal"), undefined);
+    assert.equal(field(proposal, "protocol"), "tool.authorization.v1");
+    assert.equal(field(proposal, "name"), "canvas_create_text_node");
+    assert.deepEqual(field(proposal, "input"), { text: "只写入第二个画布" });
+    assert.equal(field(proposal, "dispatchName"), "canvas_apply_ops");
+    assert.deepEqual(field(proposal, "dispatchInput"), {
+        ops: [{
+            type: "add_node",
+            nodeType: "text",
+            position: { x: 0, y: 0 },
+            metadata: { content: "只写入第二个画布", status: "success", fontSize: 14 },
+        }],
+    });
+    assert.match(String(field(proposal, "commitment")), /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(second.event("tool_call"), undefined);
+    await approve(session, second, "second");
     const call = second.event("tool_call");
     assert.equal(first.event("tool_call"), undefined);
     assert.equal(field(call, "name"), "canvas_apply_ops");
+    assert.equal(field(call, "requestId"), field(proposal, "operationId"));
+    assert.equal("authorization" in (call as Record<string, unknown>), false);
+    assert.equal(await session.decideTool("second", { operationId: String(field(proposal, "operationId")), decision: "approve" }, permit()), false);
+    assert.equal(second.events("tool_call").length, 1);
     session.resolveResult("second", { requestId: String(field(call, "requestId")), result: { ok: true } });
     assert.deepEqual(await result, { ok: true });
 });
@@ -52,6 +74,7 @@ test("当前 turn 的图片附件可在发起标签页画布创建图片节点",
     session.bindClient("first");
 
     const result = session.callTool("canvas_create_attachment_nodes", { attachmentIds: ["attachment-1"], x: 100, y: 200 });
+    await approve(session, first, "first");
     const call = first.event("tool_call");
     const input = field(call, "input") as Record<string, unknown>;
     const nodes = input.nodes as Array<Record<string, unknown>>;
@@ -101,9 +124,11 @@ test("tool result is accepted only from the request client", async (t) => {
     session.activateClient("first");
 
     const result = session.callTool("canvas_create_text_node", { text: "first only" });
-    const call = first.event("tool_call");
-    const requestId = String(field(call, "requestId"));
+    const proposal = first.event("tool_proposal");
+    const requestId = String(field(proposal, "operationId"));
 
+    assert.equal(session.resolveResult("first", { requestId, result: { early: true } }), false);
+    await approve(session, first, "first");
     assert.equal(session.resolveResult("second", { requestId, result: { client: "second" } }), false);
     assert.equal(session.resolveResult("first", { requestId, result: { client: "first" } }), true);
     assert.deepEqual(await result, { client: "first" });
@@ -125,6 +150,145 @@ test("生成状态查询由当前激活网页返回", async (t) => {
     assert.equal(field(call, "name"), "generation_get_status");
     session.resolveResult("second", { requestId: String(field(call, "requestId")), result: { total: 1, tasks: [{ id: "image-1", status: "running" }] } });
     assert.deepEqual(await result, { total: 1, tasks: [{ id: "image-1", status: "running" }] });
+});
+
+test("the fixed read-only allowlist dispatches without a permit", async (t) => {
+    assert.deepEqual(READ_ONLY_TOOL_NAMES, [
+        "site_navigate",
+        "canvas_list_projects",
+        "canvas_get_state",
+        "canvas_get_selection",
+        "canvas_export_snapshot",
+        "canvas_select_nodes",
+        "canvas_set_viewport",
+        "generation_get_status",
+        "workbench_image_get_config",
+        "workbench_video_get_config",
+        "prompts_search",
+        "assets_list",
+    ]);
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    session.updateState(snapshot("canvas-first"), "first");
+
+    const result = session.callTool("canvas_select_nodes", { ids: ["node-1"] });
+    assert.equal(first.event("tool_proposal"), undefined);
+    const call = first.event("tool_call");
+    assert.equal(field(call, "name"), "canvas_apply_ops");
+    session.resolveResult("first", { requestId: String(field(call, "requestId")), result: { ok: true } });
+    assert.deepEqual(await result, { ok: true });
+});
+
+test("a rejected proposal never dispatches and rejects the MCP promise", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    const result = session.callTool("canvas_create_text_node", { text: "reject me" });
+    const outcome = result.then(() => "resolved", (error) => error instanceof Error ? error.message : String(error));
+    const operationId = String(field(first.event("tool_proposal"), "operationId"));
+
+    assert.equal(await session.decideTool("first", { operationId, decision: "reject", error: "user denied" }, () => Promise.reject(new Error("must not verify"))), true);
+    assert.match(await outcome, /user denied/);
+    assert.equal(first.event("tool_call"), undefined);
+});
+
+test("视频工作台生成在授权拒绝后不会下发，且完整视频合同保持不丢字段", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    const input = {
+        prompt: "镜头绕过产品",
+        offering: "pixverse_v6_bc2dd1ff29858228",
+        mode: "reference",
+        duration: 5,
+        resolution: "720p",
+        aspectRatio: "9:16",
+        audio: true,
+        parameters: { seed: 42 },
+        references: { images: [{ objectId: "10000000-0000-4000-8000-000000000001" }] },
+        requestId: "agent-video-contract-test",
+    };
+    const result = session.callTool("workbench_video_generate", input);
+    const proposal = first.event("tool_proposal");
+
+    assert.equal(field(proposal, "name"), "workbench_video_generate");
+    assert.deepEqual(field(proposal, "input"), input);
+    assert.equal(await session.decideTool("first", { operationId: String(field(proposal, "operationId")), decision: "reject", error: "user denied" }, () => Promise.reject(new Error("must not verify"))), true);
+    await assert.rejects(result, /user denied/);
+    assert.equal(first.event("tool_call"), undefined);
+});
+
+test("视频工作台只接受本站 generation input 对象 ID", () => {
+    assert.throws(
+        () =>
+            toolInputSchemas.workbench_video_generate.parse({
+                prompt: "镜头绕过产品",
+                references: { images: [{ objectId: "https://untrusted.example/input.png" }] },
+            }),
+        /uuid/i,
+    );
+});
+
+test("failed verification consumes the proposal without dispatching", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    const result = session.callTool("canvas_create_text_node", { text: "bad permit" });
+    const outcome = result.then(() => "resolved", (error) => error instanceof Error ? error.message : String(error));
+    const operationId = String(field(first.event("tool_proposal"), "operationId"));
+
+    await assert.rejects(session.decideTool("first", { operationId, decision: "approve" }, async () => {
+        throw new Error("invalid permit");
+    }), /invalid permit/);
+    assert.match(await outcome, /invalid permit/);
+    assert.equal(first.event("tool_call"), undefined);
+    assert.equal(await session.decideTool("first", { operationId, decision: "approve" }, permit()), false);
+});
+
+test("permits cannot be exchanged between concurrent operations", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    const results = [
+        session.callTool("canvas_create_text_node", { text: "one" }),
+        session.callTool("canvas_create_text_node", { text: "two" }),
+    ];
+    const outcomes = results.map((result) => result.then(() => "resolved", (error) => error instanceof Error ? error.message : String(error)));
+    const proposals = first.events("tool_proposal") as PendingToolProposal[];
+    assert.equal(proposals.length, 2);
+
+    await assert.rejects(session.decideTool("first", { operationId: proposals[0].operationId, decision: "approve" }, boundPermit(proposals[1])), /binding mismatch/);
+    await assert.rejects(session.decideTool("first", { operationId: proposals[1].operationId, decision: "approve" }, boundPermit(proposals[0])), /binding mismatch/);
+    assert.deepEqual(await Promise.all(outcomes), ["binding mismatch", "binding mismatch"]);
+    assert.equal(first.event("tool_call"), undefined);
+});
+
+test("a consumed permit JTI cannot authorize another operation", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+
+    const firstResult = session.callTool("canvas_create_text_node", { text: "one" });
+    await approve(session, first, "first", "shared-jti");
+    const firstCall = first.event("tool_call");
+    session.resolveResult("first", { requestId: String(field(firstCall, "requestId")), result: { ok: true } });
+    await firstResult;
+
+    const secondResult = session.callTool("canvas_create_text_node", { text: "two" });
+    const secondOutcome = secondResult.then(() => "resolved", (error) => error instanceof Error ? error.message : String(error));
+    const secondProposal = first.events("tool_proposal").at(-1) as PendingToolProposal;
+    await assert.rejects(session.decideTool("first", { operationId: secondProposal.operationId, decision: "approve" }, permit("shared-jti")), /already been used/);
+    assert.match(await secondOutcome, /already been used/);
+    assert.equal(first.events("tool_call").length, 1);
+});
+
+test("a proposal timeout rejects without dispatching", async (t) => {
+    const session = new CanvasSession({ requestTimeoutMs: 5 });
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    await assert.rejects(session.callTool("canvas_create_text_node", { text: "too slow" }), /许可超时/);
+    assert.equal(first.event("tool_call"), undefined);
 });
 
 test("活动网页关闭后回退到仍连接的画布", async (t) => {
@@ -167,8 +331,8 @@ test("closing a client rejects its pending tool requests", async () => {
     const session = new CanvasSession();
     const first = connect(session, "first");
     const result = session.callTool("canvas_create_text_node", { text: "pending" });
-    const call = first.event("tool_call");
-    const requestId = String(field(call, "requestId"));
+    const proposal = first.event("tool_proposal");
+    const requestId = String(field(proposal, "operationId"));
     first.close();
 
     const outcome = await Promise.race([
@@ -206,6 +370,25 @@ test("new clients receive the current Codex state and later updates", (t) => {
     assert.deepEqual(client.event("codex_state"), { busy: false, threadId: "thread-2", turnId: "turn-1" });
 });
 
+test("runtime handoff remains busy until every Codex HTTP operation is released", () => {
+    const session = new CanvasSession();
+    const releaseFirst = session.beginCodexOperation();
+    const releaseSecond = session.beginCodexOperation();
+
+    assert.equal(session.codexBusy, false);
+    assert.equal(session.runtimeBusy, true);
+    releaseFirst();
+    releaseFirst();
+    assert.equal(session.runtimeBusy, true);
+    releaseSecond();
+    assert.equal(session.runtimeBusy, false);
+
+    session.setCodexState({ busy: true });
+    assert.equal(session.runtimeBusy, true);
+    session.setCodexState({ busy: false });
+    assert.equal(session.runtimeBusy, false);
+});
+
 test("a bound client remains the tool target while focus changes", async (t) => {
     const session = new CanvasSession();
     const first = connect(session, "first");
@@ -221,6 +404,7 @@ test("a bound client remains the tool target while focus changes", async (t) => 
 
     assert.equal(field(await session.callTool("canvas_get_state", {}), "projectId"), "canvas-first");
     const result = session.callTool("canvas_create_text_node", { text: "bound" });
+    await approve(session, first, "first");
     const call = first.event("tool_call");
     assert.equal(second.event("tool_call"), undefined);
     session.resolveResult("first", { requestId: String(field(call, "requestId")), result: { ok: true } });
@@ -246,6 +430,7 @@ test("closing the bound client falls back to the active client", async (t) => {
 
     assert.equal(field(await session.callTool("canvas_get_state", {}), "projectId"), "canvas-second");
     const result = session.callTool("canvas_create_text_node", { text: "fallback" });
+    await approve(session, second, "second");
     const call = second.event("tool_call");
     session.resolveResult("second", { requestId: String(field(call, "requestId")), result: { ok: true } });
     assert.deepEqual(await result, { ok: true });
@@ -261,6 +446,26 @@ function connect(session: CanvasSession, clientId: string) {
 /** 创建最小画布快照。 */
 function snapshot(projectId: string) {
     return { projectId, title: projectId, nodes: [], connections: [], selectedNodeIds: [], viewport: { x: 0, y: 0, k: 1 } };
+}
+
+let permitSequence = 0;
+
+async function approve(session: CanvasSession, response: FakeSseResponse, clientId: string, jti = `permit-${++permitSequence}`) {
+    const proposal = response.events("tool_proposal").at(-1) as PendingToolProposal | undefined;
+    assert.ok(proposal);
+    assert.equal(await session.decideTool(clientId, { operationId: proposal.operationId, decision: "approve" }, permit(jti)), true);
+    return proposal;
+}
+
+function permit(jti = `permit-${++permitSequence}`) {
+    return async (_proposal: PendingToolProposal) => ({ jti, expiresAt: Date.now() + 10_000 });
+}
+
+function boundPermit(expected: PendingToolProposal) {
+    return async (actual: PendingToolProposal) => {
+        if (actual.operationId !== expected.operationId || actual.commitment !== expected.commitment) throw new Error("binding mismatch");
+        return { jti: `permit-${++permitSequence}`, expiresAt: Date.now() + 10_000 };
+    };
 }
 
 /** 安全读取测试对象字段。 */
@@ -285,9 +490,16 @@ class FakeSseResponse extends EventEmitter {
 
     /** 读取指定类型的首个 SSE 事件数据。 */
     event(type: string) {
-        const chunk = this.chunks.find((item) => item.startsWith(`event: ${type}\n`));
-        const data = chunk?.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
-        return data ? (JSON.parse(data) as unknown) : undefined;
+        return this.events(type)[0];
+    }
+
+    /** 读取指定类型的全部 SSE 事件数据。 */
+    events(type: string) {
+        return this.chunks.flatMap((chunk) => {
+            if (!chunk.startsWith(`event: ${type}\n`)) return [];
+            const data = chunk.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+            return data ? [JSON.parse(data) as unknown] : [];
+        });
     }
 
     /** 触发连接关闭事件。 */

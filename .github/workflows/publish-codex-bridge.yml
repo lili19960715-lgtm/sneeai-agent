@@ -1,0 +1,65 @@
+name: Publish Sneeai Codex Bridge
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "plugin-bridge/**"
+      - ".github/workflows/publish-codex-bridge.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-sneeai-codex-bridge
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin-bridge
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install current npm
+        run: npm install --global npm@^11.12.0
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify bridge
+        run: npm test && npm run typecheck
+
+      - name: Check package version
+        id: package
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          published=$(npm view "$name@$version" version 2>/dev/null || true)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -n "$published" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.package.outputs.should_publish == 'true'
+        run: npm publish --access public
+
+      - name: Skip existing version
+        if: steps.package.outputs.should_publish != 'true'
+        run: echo "${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }} already exists on npm, skipping publish."

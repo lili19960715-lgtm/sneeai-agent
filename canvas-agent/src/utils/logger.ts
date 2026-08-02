@@ -1,16 +1,16 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {inspect} from "node:util";
 
 import winston, {format, transports, type Logger as WinstonLogger} from "winston";
 
+import {CONFIG_DIR} from "../config.js";
 import {formatDateForFilename} from "./date.js";
 
-/** 管理 Canvas Agent 的终端与文件 Debug 日志。 */
+/** 管理 Sneeai Agent 的终端与文件 Debug 日志。 */
 export class Logger {
     readonly enabled = process.argv.includes("--debug");
-    readonly filePath = this.enabled ? path.join(os.homedir(), ".sneeai-agent", "logs", `sneeai-agent-${formatDateForFilename()}.log`) : "";
+    readonly filePath = this.enabled ? path.join(CONFIG_DIR, "logs", `canvas-agent-${formatDateForFilename()}.log`) : "";
     private readonly logger: WinstonLogger | null;
 
     /** 根据命令行 Debug 参数初始化日志输出。 */
@@ -21,11 +21,15 @@ export class Logger {
         }
         fs.mkdirSync(path.dirname(this.filePath), {recursive: true});
         const line = format.printf(({level, message, timestamp, details}) => `${timestamp} ${level.toUpperCase()} ${message}${formatDetails(details)}`);
+        const mcpMode = process.argv.slice(2).filter((arg) => arg !== "--debug")[0] === "mcp";
         this.logger = winston.createLogger({
             level: "debug",
             transports: [
-                new transports.Console({format: format.combine(format.timestamp({format: "HH:mm:ss"}), line)}),
-                new transports.File({filename: this.filePath, format: format.combine(format.timestamp({format: "HH:mm:ss"}), line)}),
+                new transports.Console({
+                    format: format.combine(format.timestamp({format: "HH:mm:ss"}), line),
+                    ...(mcpMode ? {stderrLevels: ["debug", "info", "warn", "error"]} : {}),
+                }),
+                new transports.File({filename: this.filePath, options: {mode: 0o600}, format: format.combine(format.timestamp({format: "HH:mm:ss"}), line)}),
             ],
         });
     }
@@ -66,8 +70,11 @@ function formatDetails(details: unknown) {
 /** 清理日志内容中的敏感数据和不可序列化引用。 */
 function sanitize(value: unknown, key = "", seen = new WeakSet<object>()): unknown {
     if (/token|authorization|api.?key|dataurl/i.test(key)) return "[REDACTED]";
-    if (typeof value === "string" && value.startsWith("data:")) return `[DATA URL ${value.length} chars]`;
-    if (value instanceof Error) return {name: value.name, message: value.message, stack: value.stack};
+    if (typeof value === "string") {
+        if (value.startsWith("data:")) return `[DATA URL ${value.length} chars]`;
+        return redactSensitiveText(value);
+    }
+    if (value instanceof Error) return {name: value.name, message: redactSensitiveText(value.message), stack: value.stack ? redactSensitiveText(value.stack) : undefined};
     if (!value || typeof value !== "object") return value;
     if (seen.has(value)) return "[CIRCULAR]";
     seen.add(value);
@@ -76,3 +83,12 @@ function sanitize(value: unknown, key = "", seen = new WeakSet<object>()): unkno
 }
 
 export const logger = new Logger();
+
+/** Redact credential-shaped values before diagnostics can leave the local process. */
+export function redactSensitiveText(value: string) {
+    return value
+        .replace(/(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
+        .replace(/([?&](?:api[_-]?key|token|secret|password|authorization)=)[^&#\s]+/gi, "$1[REDACTED]")
+        .replace(/(\b(?:api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*)(["']?)[^\s,;"'}]+/gi, "$1$2[REDACTED]")
+        .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]");
+}

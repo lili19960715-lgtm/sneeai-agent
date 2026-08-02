@@ -3,34 +3,29 @@ import os from "node:os";
 import path from "node:path";
 
 import { logger } from "../utils/logger.js";
+import { redactSensitiveText } from "../utils/logger.js";
 import { errorMessage, field } from "../utils/value.js";
 import { CodexAppClient } from "./codex-client.js";
 import { summarizeCodexThread, threadMessages } from "./codex-history.js";
+import { CodexProviderPolicyError } from "./codex-provider-policy.js";
+import { activeCanvasCodexRuntime } from "./codex-runtime.js";
 import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "./types.js";
-import type { AgentCodexRuntime } from "../config.js";
 
-type CodexRunOptions = { threadId?: string; cwd?: string; permissionMode?: AgentPermissionMode; runtime?: AgentCodexRuntime; appEmit?: AgentEmit; onStart?: () => void; onThread?: (threadId: string) => void; onTurn?: (turnId: string) => void; onFinish?: () => void };
+type CodexRunOptions = { threadId?: string; cwd?: string; profileId?: string; permissionMode?: AgentPermissionMode; appEmit?: AgentEmit; onStart?: () => void; onThread?: (threadId: string) => void; onTurn?: (turnId: string) => void; onFinish?: () => void };
 
 let codexQueue: Promise<unknown> = Promise.resolve();
-type RuntimeState = { app: CodexAppClient | null; appStart: Promise<CodexAppClient> | null; threadId: string; unmaterializedThreadIds: Set<string> };
-const runtimes = new Map<AgentCodexRuntime, RuntimeState>();
-
-function runtimeState(runtime: AgentCodexRuntime): RuntimeState {
-    let state = runtimes.get(runtime);
-    if (!state) {
-        state = { app: null, appStart: null, threadId: "", unmaterializedThreadIds: new Set<string>() };
-        runtimes.set(runtime, state);
-    }
-    return state;
-}
+let codexLifecycle: Promise<unknown> = Promise.resolve();
+let codexApp: CodexAppClient | null = null;
+let codexAppFingerprint = "";
+let codexTurnApp: CodexAppClient | null = null;
+let codexTurnProfileId = "";
+let codexProviderPolicyDenial: { fingerprint: string; message: string } | null = null;
+let codexThreadId = "";
+let codexWorkspacePath = "";
+let codexProfileId = "";
+const unmaterializedThreadIds = new Set<string>();
 
 export { summarizeCodexThread } from "./codex-history.js";
-
-/** 将 app-server 账户响应转换成网页可用的脱敏状态。 */
-export function classifyCodexAccount(account: { type?: string; planType?: string | null } | null) {
-    const authMode = account?.type === "apiKey" ? "apikey" as const : account?.type === "chatgpt" ? "chatgpt" as const : null;
-    return { connected: Boolean(account), authMode, planType: account?.planType || null };
-}
 
 /** 将 Codex turn 加入串行队列并等待执行完成。 */
 export async function runCodexTurn(prompt: string, emit: AgentEmit, attachments: AgentAttachment[] = [], options: CodexRunOptions = {}) {
@@ -40,60 +35,74 @@ export async function runCodexTurn(prompt: string, emit: AgentEmit, attachments:
 }
 
 /** 中断当前线程正在执行的 Codex turn。 */
-export async function interruptCodexTurn(threadId?: string, runtime: AgentCodexRuntime = "subscription") {
-    const state = runtimeState(runtime);
-    if (!state.app || (threadId && threadId !== state.threadId)) return false;
-    return await state.app.interruptCurrentTurn();
+export async function interruptCodexTurn(threadId?: string, profileId?: string) {
+    if (!codexApp || (threadId && threadId !== codexThreadId) || (profileId && profileId !== codexProfileId)) return false;
+    return await codexApp.interruptCurrentTurn();
 }
 
 /** 回复当前 app-server 的待处理权限请求。 */
-export async function resolveCodexApproval(requestId: string, decision: string, runtime: AgentCodexRuntime = "subscription") {
-    return Boolean(runtimeState(runtime).app?.resolveApproval(requestId, decision));
+export async function resolveCodexApproval(requestId: string, decision: string) {
+    return Boolean(codexApp?.resolveApproval(requestId, decision));
 }
 
-/** 读取指定 Codex 运行环境的脱敏账户状态。 */
-export async function readCodexAccount(emit: AgentEmit, runtime: AgentCodexRuntime = "subscription") {
-    const result = await (await getCodexApp(emit, runtime)).readAccount();
-    return { ...classifyCodexAccount(result.account), runtime };
+/** 在网页建立 Agent 会话前验证当前 Codex 订阅或 KapeAI 中转配置。 */
+export async function verifyCodexProviderAccess(emit: AgentEmit, profileId?: string) {
+    selectCodexScope(undefined, profileId);
+    await getCodexApp(emit);
 }
 
-/** 配置 Agent 专用 KapeAI 运行环境，密钥不会被返回或写入站点配置。 */
-export async function configureKapeaiApiKey(emit: AgentEmit, apiKey: string) {
-    const app = await getCodexApp(emit, "kapeai");
-    await app.loginWithApiKey(apiKey);
-    return readCodexAccount(emit, "kapeai");
+/** 停止当前 Codex app-server 并清空所有进程内线程状态。 */
+export async function stopCodexApp() {
+    await withCodexLifecycle(async () => {
+        const app = codexApp;
+        codexApp = null;
+        codexAppFingerprint = "";
+        clearCodexThreadState();
+        clearCodexScope();
+        await app?.dispose();
+    });
 }
 
-/** 清除 Agent 专用 Codex 家目录内的登录凭据。 */
-export async function clearKapeaiApiKey(emit: AgentEmit) {
-    await (await getCodexApp(emit, "kapeai")).logout();
+/** 仅当指定 profile 正在占用 app-server 时停止它。 */
+export async function stopCodexProfile(profileId: string) {
+    return await withCodexLifecycle(async () => {
+        if (!profileId || codexProfileId !== profileId) return false;
+        const app = codexApp;
+        codexApp = null;
+        codexAppFingerprint = "";
+        clearCodexThreadState();
+        clearCodexScope();
+        await app?.dispose();
+        return true;
+    });
 }
 
 /** 创建新的 Codex 线程并记录当前线程 ID。 */
-export async function startCodexThread(emit: AgentEmit, cwd?: string, permissionMode: AgentPermissionMode = "request", runtime: AgentCodexRuntime = "subscription") {
-    const state = runtimeState(runtime);
-    const app = await getCodexApp(emit, runtime);
-    const thread = await app.startThread(cwd, permissionMode);
-    state.threadId = String(field(thread, "id") || "");
-    if (state.threadId) state.unmaterializedThreadIds.add(state.threadId);
+export async function startCodexThread(emit: AgentEmit, cwd?: string, permissionMode: AgentPermissionMode = "request", profileId?: string) {
+    selectCodexScope(cwd, profileId);
+    const app = await getCodexApp(emit);
+    const thread = await app.startThread(cwd, permissionMode, profileId);
+    codexThreadId = String(field(thread, "id") || "");
+    if (codexThreadId) unmaterializedThreadIds.add(codexThreadId);
     return thread;
 }
 
 /** 恢复指定 Codex 线程并返回聊天历史。 */
-export async function resumeCodexThread(emit: AgentEmit, threadId: string, cwd?: string, permissionMode: AgentPermissionMode = "request", runtime: AgentCodexRuntime = "subscription") {
-    const state = runtimeState(runtime);
-    const app = await getCodexApp(emit, runtime);
-    await loadCodexThread(emit, threadId, cwd, false, runtime);
-    const thread = await app.resumeThread(threadId, cwd, permissionMode);
+export async function resumeCodexThread(emit: AgentEmit, threadId: string, cwd?: string, permissionMode: AgentPermissionMode = "request", profileId?: string) {
+    selectCodexScope(cwd, profileId);
+    const app = await getCodexApp(emit);
+    await loadCodexThread(emit, threadId, cwd, false, profileId);
+    const thread = await app.resumeThread(threadId, cwd, permissionMode, profileId);
     assertThreadWorkspace(thread, cwd);
-    state.threadId = String(field(thread, "id") || threadId);
-    const historyThread = await loadCodexThread(emit, state.threadId, cwd, true, runtime);
+    codexThreadId = String(field(thread, "id") || threadId);
+    const historyThread = await loadCodexThread(emit, codexThreadId, cwd, true, profileId);
     return { thread, messages: threadMessages(historyThread, app.planUpdates(threadId)) };
 }
 
 /** 查询当前工作空间中的 Codex 线程。 */
-export async function listCodexThreads(emit: AgentEmit, options: { cwd: string; searchTerm?: string; limit?: number; runtime?: AgentCodexRuntime }) {
-    const app = await getCodexApp(emit, options.runtime || "subscription");
+export async function listCodexThreads(emit: AgentEmit, options: { cwd: string; searchTerm?: string; limit?: number; profileId?: string }) {
+    selectCodexScope(options.cwd, options.profileId);
+    const app = await getCodexApp(emit);
     const result = await app.listThreads({
         limit: options.limit || 40,
         sortKey: "updated_at",
@@ -107,33 +116,34 @@ export async function listCodexThreads(emit: AgentEmit, options: { cwd: string; 
 }
 
 /** 读取指定 Codex 线程及其聊天历史。 */
-export async function readCodexThread(emit: AgentEmit, threadId: string, cwd?: string, runtime: AgentCodexRuntime = "subscription") {
-    const app = await getCodexApp(emit, runtime);
-    const state = runtimeState(runtime);
+export async function readCodexThread(emit: AgentEmit, threadId: string, cwd?: string, profileId?: string) {
+    selectCodexScope(cwd, profileId);
+    const app = await getCodexApp(emit);
     let thread: unknown;
     try {
-        thread = await loadCodexThread(emit, threadId, cwd, !state.unmaterializedThreadIds.has(threadId), runtime);
+        thread = await loadCodexThread(emit, threadId, cwd, !unmaterializedThreadIds.has(threadId), profileId);
     } catch (error) {
         if (!/not materialized yet.*includeTurns/i.test(errorMessage(error))) throw error;
-        state.unmaterializedThreadIds.add(threadId);
-        thread = await loadCodexThread(emit, threadId, cwd, false, runtime);
+        unmaterializedThreadIds.add(threadId);
+        thread = await loadCodexThread(emit, threadId, cwd, false, profileId);
     }
     return { thread: summarizeCodexThread(thread), messages: threadMessages(thread, app.planUpdates(threadId)) };
 }
 
 /** 确认指定 Codex 线程属于当前工作空间。 */
-export async function verifyCodexThreadWorkspace(emit: AgentEmit, threadId: string, cwd: string, runtime: AgentCodexRuntime = "subscription") {
-    await loadCodexThread(emit, threadId, cwd, false, runtime);
+export async function verifyCodexThreadWorkspace(emit: AgentEmit, threadId: string, cwd: string, profileId?: string) {
+    selectCodexScope(cwd, profileId);
+    await loadCodexThread(emit, threadId, cwd, false, profileId);
 }
 
 /** 归档指定 Codex 线程。 */
-export async function archiveCodexThread(emit: AgentEmit, threadId: string, cwd?: string, runtime: AgentCodexRuntime = "subscription") {
-    const app = await getCodexApp(emit, runtime);
-    const state = runtimeState(runtime);
-    await loadCodexThread(emit, threadId, cwd, false, runtime);
+export async function archiveCodexThread(emit: AgentEmit, threadId: string, cwd?: string, profileId?: string) {
+    selectCodexScope(cwd, profileId);
+    const app = await getCodexApp(emit);
+    await loadCodexThread(emit, threadId, cwd, false, profileId);
     await app.archiveThread(threadId);
     app.clearPlanUpdates(threadId);
-    state.unmaterializedThreadIds.delete(threadId);
+    unmaterializedThreadIds.delete(threadId);
 }
 
 /** 判断线程异常是否允许自动新建线程后重试。 */
@@ -144,63 +154,68 @@ export function isRecoverableThreadError(error: unknown) {
 /** 执行一次 Codex turn，并负责附件临时文件和线程恢复。 */
 async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: AgentAttachment[], options: CodexRunOptions) {
     let files: string[] = [];
+    let turnApp: CodexAppClient | null = null;
     try {
         options.onStart?.();
+        selectCodexScope(options.cwd, options.profileId);
         files = await writeAttachmentFiles(attachments);
-        const runtime = options.runtime || "subscription";
-        const state = runtimeState(runtime);
-        const app = await getCodexApp(options.appEmit || emit, runtime);
-        let threadId = await ensureCodexThread(app, options, emit, runtime);
+        const app = await getCodexApp(options.appEmit || emit, true);
+        turnApp = app;
+        let threadId = await ensureCodexThread(app, options, emit);
         options.onThread?.(threadId);
-        state.unmaterializedThreadIds.delete(threadId);
+        unmaterializedThreadIds.delete(threadId);
         try {
             await app.startTurn(threadId, prompt, files, options.permissionMode || "request", options.onTurn);
         } catch (error) {
             if (!isRecoverableThreadError(error)) throw error;
-            emit("agent_log", { text: `Codex thread unavailable, starting a new thread: ${errorMessage(error)}` });
-            state.threadId = "";
-            threadId = await ensureCodexThread(app, { cwd: options.cwd, runtime }, emit, runtime);
+            emit("agent_log", { text: `Codex 会话不可用，正在创建新会话：${redactSensitiveText(errorMessage(error))}` });
+            codexThreadId = "";
+            threadId = await ensureCodexThread(app, options, emit);
             options.onThread?.(threadId);
-            state.unmaterializedThreadIds.delete(threadId);
+            unmaterializedThreadIds.delete(threadId);
             await app.startTurn(threadId, prompt, files, options.permissionMode || "request", options.onTurn);
         }
     } catch (error) {
         logger.error("Codex turn failed", error);
-        emit("agent_error", { message: errorMessage(error) });
+        emit("agent_error", { message: redactSensitiveText(errorMessage(error)) });
     } finally {
+        if (codexTurnApp === turnApp) {
+            codexTurnApp = null;
+            codexTurnProfileId = "";
+        }
         options.onFinish?.();
         await Promise.all(files.map((file) => fs.unlink(file).catch(() => undefined)));
     }
 }
 
 /** 恢复请求线程或创建新的 Codex 线程。 */
-async function ensureCodexThread(app: CodexAppClient, options: CodexRunOptions, emit: AgentEmit, runtime: AgentCodexRuntime) {
-    const state = runtimeState(runtime);
+async function ensureCodexThread(app: CodexAppClient, options: CodexRunOptions, emit: AgentEmit) {
     if (options.threadId) {
-        if (options.threadId === state.threadId) return state.threadId;
+        if (options.threadId === codexThreadId) return codexThreadId;
         try {
             const result = await app.readThread(options.threadId, false);
             assertThreadWorkspace(field(result, "thread") || {}, options.cwd);
-            const thread = await app.resumeThread(options.threadId, options.cwd, options.permissionMode || "request");
+            const thread = await app.resumeThread(options.threadId, options.cwd, options.permissionMode || "request", options.profileId);
             assertThreadWorkspace(thread, options.cwd);
-            state.threadId = String(field(thread, "id") || options.threadId);
-            return state.threadId;
+            codexThreadId = String(field(thread, "id") || options.threadId);
+            return codexThreadId;
         } catch (error) {
             if (!isRecoverableThreadError(error)) throw error;
-            emit("agent_log", { text: `Codex thread unavailable, starting a new thread: ${errorMessage(error)}` });
+            emit("agent_log", { text: `Codex 会话不可用，正在创建新会话：${redactSensitiveText(errorMessage(error))}` });
         }
     }
-    if (!state.threadId) {
-        const thread = await app.startThread(options.cwd, options.permissionMode || "request");
-        state.threadId = String(field(thread, "id") || "");
-        if (state.threadId) state.unmaterializedThreadIds.add(state.threadId);
+    if (!codexThreadId) {
+        const thread = await app.startThread(options.cwd, options.permissionMode || "request", options.profileId);
+        codexThreadId = String(field(thread, "id") || "");
+        if (codexThreadId) unmaterializedThreadIds.add(codexThreadId);
     }
-    return state.threadId;
+    return codexThreadId;
 }
 
 /** 从 app-server 读取线程并校验工作空间。 */
-async function loadCodexThread(emit: AgentEmit, threadId: string, cwd: string | undefined, includeTurns: boolean, runtime: AgentCodexRuntime) {
-    const app = await getCodexApp(emit, runtime);
+async function loadCodexThread(emit: AgentEmit, threadId: string, cwd: string | undefined, includeTurns: boolean, profileId?: string) {
+    selectCodexScope(cwd, profileId);
+    const app = await getCodexApp(emit);
     const result = await app.readThread(threadId, includeTurns);
     const thread = field(result, "thread") || {};
     assertThreadWorkspace(thread, cwd);
@@ -208,19 +223,80 @@ async function loadCodexThread(emit: AgentEmit, threadId: string, cwd: string | 
 }
 
 /** 获取已启动的 Codex app-server 客户端。 */
-async function getCodexApp(emit: AgentEmit, runtime: AgentCodexRuntime) {
-    const state = runtimeState(runtime);
-    if (state.app) return state.app;
-    state.appStart ||= CodexAppClient.start(emit, () => {
-        state.app = null;
-        state.threadId = "";
+async function getCodexApp(emit: AgentEmit, reserveForTurn = false) {
+    return await withCodexLifecycle(async () => {
+        const runtime = activeCanvasCodexRuntime();
+        const fingerprint = runtime.fingerprint;
+        if (codexProviderPolicyDenial?.fingerprint !== fingerprint) codexProviderPolicyDenial = null;
+        if (codexProviderPolicyDenial) throw new CodexProviderPolicyError(codexProviderPolicyDenial.message);
+        if (codexApp && (codexAppFingerprint === fingerprint || codexTurnApp === codexApp)) {
+            if (codexTurnApp === codexApp && codexTurnProfileId && codexProfileId !== codexTurnProfileId) throw new Error("Codex 正在另一个 profile 中运行");
+            codexApp.setEmitter(emit);
+            if (reserveForTurn) {
+                codexTurnApp = codexApp;
+                codexTurnProfileId = codexProfileId;
+            }
+            return codexApp;
+        }
+
+        const previous = codexApp;
+        codexApp = null;
+        codexAppFingerprint = "";
+        clearCodexThreadState();
+        await previous?.dispose();
+
+        let app: CodexAppClient;
+        try {
+            app = await CodexAppClient.start(emit, (exited) => {
+                if (codexApp !== exited) return;
+                codexApp = null;
+                codexAppFingerprint = "";
+                clearCodexThreadState();
+            }, runtime.env);
+        } catch (error) {
+            if (error instanceof CodexProviderPolicyError) codexProviderPolicyDenial = { fingerprint, message: error.message };
+            throw error;
+        }
+        codexProviderPolicyDenial = null;
+        codexApp = app;
+        codexAppFingerprint = fingerprint;
+        if (reserveForTurn) {
+            codexTurnApp = app;
+            codexTurnProfileId = codexProfileId;
+        }
+        return app;
     });
-    try {
-        state.app = await state.appStart;
-        return state.app;
-    } finally {
-        state.appStart = null;
+}
+
+function withCodexLifecycle<T>(operation: () => Promise<T>) {
+    const result = codexLifecycle.catch(() => undefined).then(operation);
+    codexLifecycle = result.then(() => undefined, () => undefined);
+    return result;
+}
+
+function clearCodexThreadState() {
+    codexTurnApp = null;
+    codexTurnProfileId = "";
+    codexThreadId = "";
+    unmaterializedThreadIds.clear();
+}
+
+function clearCodexScope() {
+    codexWorkspacePath = "";
+    codexProfileId = "";
+}
+
+/** 切换 profile/workspace 时丢弃进程内的默认线程指针，避免复用另一个 profile 的线程。 */
+function selectCodexScope(cwd: string | undefined, profileId: string | undefined) {
+    const workspacePath = cwd ? path.resolve(cwd) : "";
+    const nextProfileId = profileId || "";
+    if (codexTurnApp && codexTurnProfileId && nextProfileId !== codexTurnProfileId) throw new Error("Codex 正在另一个 profile 中运行");
+    if (codexWorkspacePath !== workspacePath || codexProfileId !== nextProfileId) {
+        codexThreadId = "";
+        unmaterializedThreadIds.clear();
     }
+    codexWorkspacePath = workspacePath;
+    codexProfileId = nextProfileId;
 }
 
 /** 校验线程是否属于指定工作空间。 */

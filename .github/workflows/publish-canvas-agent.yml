@@ -39,6 +39,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Verify Agent
+        run: npm run typecheck && npm test && npm run build
+
       - name: Check package version
         id: package
         run: |

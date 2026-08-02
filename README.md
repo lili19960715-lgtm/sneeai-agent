@@ -1,6 +1,6 @@
-# Sneeai Agent
+# Sneeai
 
-Sneeai Agent is the cross-platform Codex plugin and local MCP bridge for SneeAI Canvas.
+Sneeai is the Codex plugin bridge for the independently installed Sneeai Agent runtime.
 
 ## Install the Codex plugin
 
@@ -8,17 +8,17 @@ Sneeai Agent is the cross-platform Codex plugin and local MCP bridge for SneeAI 
 git clone https://github.com/sneeai/sneeai-agent.git
 cd sneeai-agent
 codex plugin marketplace add "$(pwd)"
-codex plugin add sneeai-agent@sneeai
+codex plugin add sneeai@sneeai
 ```
 
 On Windows PowerShell, use `$PWD` instead of `$(pwd)`.
 
-## Run the local agent
+## Start the local Agent
 
 ```bash
-npx -y @sneeai/sneeai-agent@0.3.2 open
+npx -y @sneeai/sneeai-agent open
 ```
 
-The package uses the user's local Codex installation and connects it to SneeAI Canvas. Codex credentials stay on the user's device.
+The Agent is downloaded and updated independently from the Codex plugin. Codex credentials stay on the user's device.
 
 See [canvas-agent/README.md](canvas-agent/README.md) for commands and configuration.

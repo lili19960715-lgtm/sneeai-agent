@@ -1,39 +1,226 @@
 import { spawn } from "node:child_process";
-import { mkdir, open as openFile, readFile, stat, unlink } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import type { Server } from "node:http";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { runClaudeTurn } from "../agent/claude.js";
-import { archiveCodexThread, clearKapeaiApiKey, configureKapeaiApiKey, interruptCodexTurn, isRecoverableThreadError, listCodexThreads, readCodexAccount, readCodexThread, resolveCodexApproval, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread, verifyCodexThreadWorkspace } from "../agent/codex.js";
-import type { AgentAttachment, AgentPermissionMode } from "../agent/types.js";
-import { CanvasSession } from "../canvas/session.js";
-import { CONFIG_DIR, DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWorkspace, type AgentCodexRuntime, type CanvasAgentConfig } from "../config.js";
+import { archiveCodexThread, interruptCodexTurn, isRecoverableThreadError, listCodexThreads, readCodexThread, resolveCodexApproval, resumeCodexThread, runCodexTurn, startCodexThread, stopCodexApp, stopCodexProfile, summarizeCodexThread, verifyCodexProviderAccess, verifyCodexThreadWorkspace } from "../agent/codex.js";
+import { CodexProviderPolicyError } from "../agent/codex-provider-policy.js";
+import { canvasCodexConnectionStatus, canvasCodexMode, CodexConnectionInputError, CodexRelayApiKeyRequiredError, configureCanvasCodexConnection, codexRuntimeFingerprint } from "../agent/codex-runtime.js";
+import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "../agent/types.js";
+import { CanvasSession, CanvasToolDecisionError, type CanvasClientAuthorization, type PendingToolProposal } from "../canvas/session.js";
+import { CanvasSessionRegistry } from "../canvas/session-registry.js";
+import { AGENT_SERVICE, canvasAgentDeviceId, DEFAULT_PORT, ensureProfileWorkspace, ensureSiteWorkspace, loadConfig, saveConfig, updateProfileWorkspace, updateSiteWorkspace, VERSION, type CanvasAgentConfig } from "../config.js";
+import { EntitlementLeaseRegistry } from "../entitlement-lease.js";
+import { canUsePersistentToken, entitlementRequired, EntitlementVerificationError, verifyPlatformEntitlement } from "../entitlement.js";
+import { createAgentPairingIdentity } from "../pairing-identity.js";
+import { createAgentTicket, EventTicketReplayGuard, EVENT_TICKET_TTL_MS, PAIRING_TICKET_TTL_MS, verifyAgentTicket, type AgentTicketAuthorization, type AgentTicketClaims } from "../pairing-ticket.js";
+import { canvasConnectionUrl, openExternalUrl } from "../pairing.js";
+import { resolveClientId, resolveProfile, type AgentProfile } from "../profile.js";
+import { negotiateProtocol, protocolHeaders, protocolMetadata, REQUIRED_PAIRING_CAPABILITIES, REQUIRED_TOOL_CAPABILITIES } from "../protocol.js";
+import { ToolAuthorizationVerificationError, verifyToolAuthorization } from "../tool-authorization.js";
 import { logger } from "../utils/logger.js";
+import { authorizeAutomaticPairing, authorizeRequestOrigin } from "./cors.js";
+import { compareRuntimeClaims, createRuntimeClaim, isRuntimeClaim } from "./runtime-claim.js";
 
-/** 启动仅监听本机的 Canvas Agent HTTP 服务。 */
-export function startHttpServer(openTarget?: string) {
+type CodexTurnOptions = {
+    threadId?: string;
+    cwd?: string;
+    profileId?: string;
+    permissionMode?: AgentPermissionMode;
+    appEmit?: AgentEmit;
+    onStart?: () => void;
+    onThread?: (threadId: string) => void;
+    onTurn?: (turnId: string) => void;
+    onFinish?: () => void;
+};
+
+type HttpCodexDependencies = {
+    verifyProviderAccess: (emit: AgentEmit, profileId?: string) => Promise<void>;
+    stopProfile: (profileId: string) => Promise<boolean>;
+    startThread: (emit: AgentEmit, cwd?: string, permissionMode?: AgentPermissionMode, profileId?: string) => Promise<unknown>;
+    runTurn: (prompt: string, emit: AgentEmit, attachments?: AgentAttachment[], options?: CodexTurnOptions) => Promise<void>;
+};
+
+export type HttpServerOptions = {
+    openCanvasUrl?: string;
+    silent?: boolean;
+    runtimeFingerprint?: string;
+    runtimeClaim?: string;
+    now?: () => number;
+    codex?: Partial<HttpCodexDependencies>;
+};
+
+type RequestAuthorization = {
+    origin: string;
+    profile: AgentProfile;
+    clientId: string;
+    session: CanvasSession;
+    ticket?: AgentTicketClaims;
+    ticketAuthorization?: AgentTicketAuthorization;
+    persistent: boolean;
+};
+
+type RequestWithAuthorization = Request & { canvasAuthorization?: RequestAuthorization };
+
+/** 启动仅监听本机的 Sneeai Agent HTTP 服务。 */
+export function startHttpServer(options: HttpServerOptions = {}) {
     const config = loadConfig(true);
     const port = Number(process.env.PORT) || Number(new URL(config.url).port) || DEFAULT_PORT;
     config.url = `http://127.0.0.1:${port}`;
     saveConfig(config);
+    const runtimeFingerprint = options.runtimeFingerprint || codexRuntimeFingerprint();
+    const runtimeClaim = isRuntimeClaim(options.runtimeClaim) ? options.runtimeClaim : createRuntimeClaim();
+    const now = options.now || Date.now;
+    const codex: HttpCodexDependencies = {
+        verifyProviderAccess: verifyCodexProviderAccess,
+        stopProfile: stopCodexProfile,
+        startThread: startCodexThread,
+        runTurn: runCodexTurn,
+        ...options.codex,
+    };
 
-    const session = new CanvasSession();
-    /** 将 Agent 事件广播到所属线程或全部网页。 */
-    const emit = (type: string, payload: unknown) => {
+    const sessions = new CanvasSessionRegistry({ now });
+    const pairingIdentity = createAgentPairingIdentity(config.token);
+    const eventTicketReplay = new EventTicketReplayGuard();
+    const knownProfiles = new Map<string, AgentProfile>();
+    const leases = new EntitlementLeaseRegistry((profileKey, reason) => {
+        sessions.disposeProfile(profileKey, `网站 Agent 授权${reason === "expired" ? "已过期" : "已失效"}`);
+        void codex.stopProfile(profileKey);
+    }, now);
+    let server: Server;
+    let handoffAccepted = false;
+    let handoffStop: Promise<void> | null = null;
+    const rememberProfile = (profile: AgentProfile) => {
+        knownProfiles.set(profile.key, profile);
+        return profile;
+    };
+    const sessionFor = (profile: AgentProfile) => sessions.session(profile.key);
+    const workspaceFor = (profile: AgentProfile) => ensureProfileWorkspace(config, profile.key);
+    /** 将 Agent 事件广播到指定 profile 的线程或全部网页。 */
+    const emitFor = (profile: AgentProfile) => (type: string, payload: unknown) => {
+        const session = sessionFor(profile);
         const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
-        const threadId = String(data.threadId || data.thread_id || ensureSiteWorkspace(config).activeThreadId || "");
+        const threadId = String(data.threadId || data.thread_id || workspaceFor(profile).activeThreadId || "");
         threadId ? session.emitThread(type, threadId, data) : session.emitAll(type, data);
     };
-    /** 保存并广播当前站点工作空间的活跃线程。 */
-    const setActiveThread = (activeThreadId: string, payload: Record<string, unknown> = {}) => {
-        const workspace = updateSiteWorkspace(config, { activeThreadId: activeThreadId || undefined });
-        session.emitThread("workspace_changed", activeThreadId, { ...payload, activeThreadId });
+    /** 将 provider 预检纳入运行时忙碌状态，避免配置交接中断检查。 */
+    const verifyCodexAccess = async (profile: AgentProfile) => {
+        const session = sessionFor(profile);
+        const release = session.beginCodexOperation();
+        try {
+            await codex.verifyProviderAccess(emitFor(profile), profile.key);
+        } finally {
+            release();
+        }
+    };
+    /** 保存并广播指定 profile 的活跃线程。 */
+    const setActiveThread = (profile: AgentProfile, activeThreadId: string, payload: Record<string, unknown> = {}) => {
+        const workspace = updateProfileWorkspace(config, profile.key, { activeThreadId: activeThreadId || undefined });
+        sessionFor(profile).emitThread("workspace_changed", activeThreadId, { ...payload, activeThreadId });
         return workspace;
     };
+    const authenticateRequest = (req: Request, res: Response, next: NextFunction) => {
+        leases.expire(now());
+        const origin = req.headers.origin || "";
+        const url = requestUrl(req, config);
+        const requestedProfile = resolveProfile({ origin, headers: req.headers, query: Object.fromEntries(url.searchParams) });
+        const requestedClientId = resolveClientId({ origin, headers: req.headers, query: Object.fromEntries(url.searchParams) });
+        const requestedTicket = headerValue(req, "x-canvas-agent-ticket") || headerValue(req, "x-canvas-agent-token");
+        const required = Boolean(origin) && entitlementRequired(origin);
+        const eventRequest = url.pathname === "/events";
+        let profile = requestedProfile;
+        let clientId = requestedClientId;
+        let ticket: AgentTicketClaims | undefined;
+        let ticketAuthorization: AgentTicketAuthorization | undefined;
+        let persistent = false;
+
+        if (requestedTicket === config.token) {
+            if (eventRequest || required || (origin && !canUsePersistentToken(origin))) return void res.status(401).json({ ok: false, error: "invalid token" });
+            persistent = true;
+        } else {
+            const verified = verifyAgentTicket(config.token, requestedTicket, {
+                kind: eventRequest ? "events" : "pairing",
+                ...(origin ? { origin } : {}),
+                ...(requestedProfile.explicit ? { profileKey: requestedProfile.key } : {}),
+                ...(requestedClientId ? { clientId: requestedClientId } : {}),
+            }, now());
+            if (!verified.ok || (eventRequest && !eventTicketReplay.consume(verified.claims, now()))) return void res.status(401).json({ ok: false, error: "invalid token" });
+            ticket = verified.claims;
+            profile = knownProfiles.get(ticket.profileKey) || (requestedProfile.explicit ? requestedProfile : { key: ticket.profileKey, id: ticket.profileKey, source: "profile", explicit: true });
+            clientId ||= ticket.clientId;
+            ticketAuthorization = ticket.authorization;
+            if (required && !leases.authorize(profile.key, origin, ticketAuthorization)) return void res.status(401).json({ ok: false, error: "invalid token" });
+        }
+
+        rememberProfile(profile);
+        (req as RequestWithAuthorization).canvasAuthorization = {
+            origin,
+            profile,
+            clientId,
+            session: sessionFor(profile),
+            ticket,
+            ticketAuthorization,
+            persistent,
+        };
+        next();
+    };
+    const requestAuthorization = (req: Request) => {
+        const authorization = (req as RequestWithAuthorization).canvasAuthorization;
+        if (!authorization) throw new Error("Sneeai Agent request was not authenticated");
+        return authorization;
+    };
+    const canvasClientAuthorization = (authorization: RequestAuthorization): CanvasClientAuthorization | undefined => {
+        if (!authorization.ticketAuthorization) return undefined;
+        return {
+            origin: authorization.origin,
+            profileId: authorization.profile.id,
+            profileKey: authorization.profile.key,
+            clientId: authorization.clientId,
+            subject: authorization.ticketAuthorization.subject,
+            deviceId: authorization.ticketAuthorization.deviceId,
+            authorizationVersion: authorization.ticketAuthorization.authorizationVersion,
+            expiresAt: authorization.ticketAuthorization.expiresAt,
+        };
+    };
     const app = express();
+    const activeResponses = new Set<Response>();
+    const requestDrainWaiters = new Set<() => void>();
+    const waitForRequestDrain = () => {
+        if (!activeResponses.size) return Promise.resolve();
+        return new Promise<void>((resolve) => {
+            let timer: ReturnType<typeof setTimeout>;
+            const done = () => {
+                clearTimeout(timer);
+                requestDrainWaiters.delete(done);
+                resolve();
+            };
+            timer = setTimeout(done, 1_000);
+            requestDrainWaiters.add(done);
+        });
+    };
     app.disable("x-powered-by");
-    app.use(express.json({ limit: "30mb" }));
+    app.use((_req, res, next) => {
+        activeResponses.add(res);
+        let released = false;
+        const release = () => {
+            if (released) return;
+            released = true;
+            activeResponses.delete(res);
+            if (!activeResponses.size) [...requestDrainWaiters].forEach((waiter) => waiter());
+        };
+        res.once("finish", release);
+        res.once("close", release);
+        next();
+    });
+    app.use((_req, res, next) => {
+        res.setHeader("X-Canvas-Agent-Service", AGENT_SERVICE);
+        res.setHeader("X-Canvas-Agent-Version", VERSION);
+        Object.entries(protocolHeaders(VERSION)).forEach(([key, value]) => res.setHeader(key, value));
+        next();
+    });
     app.use((req, res, next) => {
         if (!logger.enabled) return next();
         const startedAt = Date.now();
@@ -50,27 +237,147 @@ export function startHttpServer(openTarget?: string) {
         if (req.method === "OPTIONS") return void res.json({});
         next();
     });
-    app.get("/health", (_req, res) => res.json(session.health()));
-    app.get("/config", (_req, res) => res.json({ ok: true, url: config.url, hasToken: true }));
-    app.use((req, res, next) => {
-        if (validToken(req, requestUrl(req, config), config.token)) return next();
-        res.status(401).json({ ok: false, error: "invalid token" });
+    app.get("/health", (_req, res) => res.json({ ...sessions.health(), ...protocolMetadata(VERSION), service: AGENT_SERVICE, version: VERSION, diagnostics: sessions.health() }));
+    app.get("/config", (req, res) => {
+        res.setHeader("Cache-Control", "no-store");
+        const origin = req.headers.origin || "";
+        const trusted = !origin || authorizeAutomaticPairing(origin, process.env.CANVAS_AGENT_PAIR_ORIGINS || "", config.origins || []);
+        res.json({ ok: true, url: config.url, ...protocolMetadata(VERSION), ...(trusted ? {
+            deviceId: canvasAgentDeviceId(config),
+            instanceKey: pairingIdentity.instanceKey,
+            instancePublicKey: pairingIdentity.instancePublicKey,
+            ...publicCodexConnection(config),
+        } : {}) });
     });
-    app.get("/events", (req, res) => session.openEvents(requestUrl(req, config), res));
+    app.post("/pairing/proof", express.json({ limit: "16kb" }), route(async (req, res) => {
+        const origin = req.headers.origin || "";
+        if (!authorizeAutomaticPairing(origin, process.env.CANVAS_AGENT_PAIR_ORIGINS || "", config.origins || [])) return res.status(403).json({ ok: false, error: "origin not allowed" });
+        const negotiation = negotiateProtocol(req.body, REQUIRED_PAIRING_CAPABILITIES);
+        if (!negotiation.compatible) return res.status(426).json({ ok: false, code: "protocol_incompatible", missingCapabilities: negotiation.missingCapabilities });
+        const profile = rememberProfile(resolveProfile({ origin, body: req.body, headers: req.headers }));
+        const clientId = resolveClientId({ origin, body: req.body, headers: req.headers });
+        const proof = await pairingIdentity.prove(String(req.body?.challenge || ""), {
+            origin,
+            profileId: profile.id,
+            clientId,
+            deviceId: canvasAgentDeviceId(config),
+            agentVersion: VERSION,
+        }, { now: now() });
+        res.setHeader("Cache-Control", "no-store");
+        res.json({ ok: true, proof, instanceKey: pairingIdentity.instanceKey, instancePublicKey: pairingIdentity.instancePublicKey, ...protocolMetadata(VERSION), negotiatedCapabilities: negotiation.capabilities });
+    }));
+    app.post("/pair", express.json({ limit: "16kb" }), route(async (req, res) => {
+        const origin = req.headers.origin || "";
+        if (!authorizeAutomaticPairing(origin, process.env.CANVAS_AGENT_PAIR_ORIGINS || "", config.origins || [])) return res.status(403).json({ ok: false, error: "origin not allowed" });
+        const negotiation = negotiateProtocol(req.body, REQUIRED_PAIRING_CAPABILITIES);
+        if (!negotiation.compatible) return res.status(426).json({ ok: false, code: "protocol_incompatible", missingCapabilities: negotiation.missingCapabilities });
+        const profile = rememberProfile(resolveProfile({ origin, body: req.body, headers: req.headers }));
+        const clientId = resolveClientId({ origin, body: req.body, headers: req.headers });
+        const deviceId = canvasAgentDeviceId(config);
+        const entitlementToken = String(req.headers["x-canvas-agent-entitlement"] || "");
+        let entitlement = "";
+        let authorization: AgentTicketAuthorization | undefined;
+        if (entitlementRequired(origin)) {
+            if (!entitlementToken) throw new EntitlementVerificationError("agent_entitlement_required", "Agent entitlement is required");
+            entitlement = entitlementToken;
+            const claims = await verifyPlatformEntitlement(entitlementToken, { origin, profileId: profile.id, clientId, deviceId, instanceKey: pairingIdentity.instanceKey, agentVersion: VERSION }, { now: now() });
+            authorization = leases.renew(profile.key, claims);
+        }
+        let previousMode: "inherit" | "isolated" | null = null;
+        let modeChanged = false;
+        const session = sessionFor(profile);
+        if (req.body?.mode !== undefined) {
+            if (session.runtimeBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，暂时不能切换 Agent 中转" });
+            const mode = String(req.body.mode || "");
+            if (mode !== "inherit" && mode !== "isolated") return res.status(400).json({ ok: false, error: "Codex 连接模式无效" });
+            previousMode = canvasCodexMode(config);
+            modeChanged = previousMode !== mode;
+            configureCanvasCodexConnection(config, { mode, ...(typeof req.body.apiKey === "string" ? { apiKey: req.body.apiKey } : {}) });
+        }
+        try {
+            await verifyCodexAccess(profile);
+        } catch (error) {
+            if (modeChanged && previousMode) configureCanvasCodexConnection(config, { mode: previousMode });
+            throw error;
+        }
+        if (modeChanged) setActiveThread(profile, "", { emptyThread: true, draftThread: true });
+        config.origins ||= [];
+        if (!config.origins.includes(origin)) {
+            config.origins.push(origin);
+            saveConfig(config);
+        }
+        const pairingTicket = createAgentTicket(config.token, {
+            kind: "pairing",
+            origin,
+            profileKey: profile.key,
+            clientId,
+            now: now(),
+            ttlMs: Math.min(PAIRING_TICKET_TTL_MS, authorization ? Math.max(1, authorization.expiresAt - now()) : PAIRING_TICKET_TTL_MS),
+            authorization,
+        });
+        res.setHeader("Cache-Control", "no-store");
+        res.json({ ok: true, url: config.url, token: pairingTicket, pairingTicket, profileKey: profile.key, deviceId, instanceKey: pairingIdentity.instanceKey, instancePublicKey: pairingIdentity.instancePublicKey, service: AGENT_SERVICE, version: VERSION, ...protocolMetadata(VERSION), negotiatedCapabilities: negotiation.capabilities, ...(authorization ? { pairingConfirmation: pairingIdentity.confirm(String(req.body?.pairingNonce || ""), entitlement, pairingTicket) } : {}), ...publicCodexConnection(config) });
+    }));
+    app.use(authenticateRequest);
+    app.use(express.json({ limit: "30mb" }));
+    app.use((req, res, next) => {
+        if (!handoffAccepted || req.path === "/agent/runtime" || req.path === "/agent/runtime/handoff") return next();
+        res.status(503).json({ ok: false, error: "Sneeai Agent bridge is restarting" });
+    });
+    app.post("/agent/events-ticket", route(async (req, res) => {
+        const authorization = requestAuthorization(req);
+        const clientId = String(req.body?.clientId || authorization.clientId || "");
+        if (!clientId || clientId.length > 200) return res.status(400).json({ ok: false, error: "invalid client id" });
+        if (authorization.clientId && authorization.clientId !== clientId) return res.status(401).json({ ok: false, error: "invalid token" });
+        await verifyCodexAccess(authorization.profile);
+        const ticket = createAgentTicket(config.token, {
+            kind: "events",
+            origin: authorization.origin,
+            profileKey: authorization.profile.key,
+            clientId,
+            now: now(),
+            ttlMs: Math.min(EVENT_TICKET_TTL_MS, authorization.ticketAuthorization ? Math.max(1, authorization.ticketAuthorization.expiresAt - now()) : EVENT_TICKET_TTL_MS),
+            authorization: authorization.ticketAuthorization,
+        });
+        res.setHeader("Cache-Control", "no-store");
+        res.json({ ok: true, ticket });
+    }));
+    app.get("/events", (req, res) => {
+        const authorization = requestAuthorization(req);
+        authorization.session.openEvents(requestUrl(req, config), res, authorization.clientId, canvasClientAuthorization(authorization));
+    });
     app.post("/canvas/state", (req, res) => {
-        session.updateState(req.body, String(req.query.clientId || "") || undefined);
+        const authorization = requestAuthorization(req);
+        const clientId = authorizedClientId(authorization, String(req.query.clientId || ""));
+        authorization.session.updateState(req.body, clientId || undefined);
         res.json({ ok: true });
     });
     app.post("/canvas/activate", (req, res) => {
-        session.activateClient(String(req.query.clientId || ""));
+        const authorization = requestAuthorization(req);
+        authorization.session.activateClient(authorizedClientId(authorization, String(req.query.clientId || "")));
         res.json({ ok: true });
     });
+    app.post("/canvas/tool-decision", route(async (req, res) => {
+        const authorization = requestAuthorization(req);
+        if (!authorization.ticketAuthorization || authorization.persistent) return res.status(401).json({ ok: false, error: "invalid token" });
+        const clientId = authorizedClientId(authorization, String(req.query.clientId || ""));
+        const decision = {
+            operationId: String(req.body?.operationId || ""),
+            decision: String(req.body?.decision || "") as "approve" | "reject",
+            error: typeof req.body?.error === "string" ? req.body.error : undefined,
+        };
+        if (!decision.operationId || (decision.decision !== "approve" && decision.decision !== "reject")) return res.status(400).json({ ok: false, error: "invalid tool decision" });
+        const accepted = await authorization.session.decideTool(clientId, decision, async (proposal) => await verifyToolPermit(req, authorization, clientId, proposal, now));
+        res.status(accepted ? 200 : 409).json({ ok: accepted });
+    }));
     app.post("/canvas/result", (req, res) => {
-        const ok = session.resolveResult(String(req.query.clientId || ""), req.body);
+        const authorization = requestAuthorization(req);
+        const ok = authorization.session.resolveResult(authorizedClientId(authorization, String(req.query.clientId || "")), req.body);
         res.status(ok ? 200 : 409).json({ ok });
     });
     app.get("/agent/attachments/:attachmentId", route(async (req, res) => {
-        const attachment = session.getTurnAttachment(String(req.query.clientId || ""), routeParam(req.params.attachmentId));
+        const authorization = requestAuthorization(req);
+        const attachment = authorization.session.getTurnAttachment(authorizedClientId(authorization, String(req.query.clientId || "")), routeParam(req.params.attachmentId));
         const data = attachment.dataUrl.split(",", 2)[1];
         if (!data) throw new Error("图片附件内容无效");
         res.setHeader("Cache-Control", "no-store");
@@ -91,94 +398,116 @@ export function startHttpServer(openTarget?: string) {
         res.setHeader("Cache-Control", "no-store");
         res.type(path.extname(filePath)).send(await readFile(filePath));
     }));
-    app.post("/api/tools", route(async (req, res) => res.json({ ok: true, result: await session.callTool(req.body?.name, req.body?.input || {}) })));
-    app.get("/agent/codex/workspace", (_req, res) => {
-        const workspace = ensureSiteWorkspace(config);
+    app.post("/api/tools", route(async (req, res) => {
+        const authorization = requestAuthorization(req);
+        if (!requestHasToolProtocol(req)) return res.status(426).json({ ok: false, code: "protocol_incompatible" });
+        res.json({ ok: true, result: await authorization.session.callTool(req.body?.name, req.body?.input || {}) });
+    }));
+    app.get("/agent/codex/workspace", route(async (req, res) => {
+        const authorization = requestAuthorization(req);
+        await verifyCodexAccess(authorization.profile);
+        const workspace = workspaceFor(authorization.profile);
         res.json({ ok: true, workspace });
+    }));
+    app.use("/agent/codex", (_req, res, next) => {
+        const release = requestAuthorization(_req).session.beginCodexOperation();
+        res.once("finish", release);
+        res.once("close", release);
+        next();
     });
-    app.get("/agent/codex/account", route(async (_req, res) => {
-        const selectedRuntime = config.codexRuntime || "subscription";
-        const subscription = await readCodexAccount(emit, "subscription");
-        const kapeai = await readCodexAccount(emit, "kapeai").catch(() => ({ connected: false, authMode: null, planType: null, runtime: "kapeai" as const }));
-        res.json({ ok: true, selectedRuntime, subscription, kapeai, agentApiConfigured: kapeai.connected && kapeai.authMode === "apikey" });
-    }));
-    app.post("/agent/codex/kapeai/configure", route(async (req, res) => {
-        if (typeof req.body?.apiKey !== "string") return res.status(400).json({ ok: false, error: "API 密钥格式无效" });
-        const apiKey = req.body.apiKey.trim();
-        if (!apiKey) return res.status(400).json({ ok: false, error: "请输入 API 密钥" });
-        await configureKapeaiApiKey(emit, apiKey);
-        config.codexRuntime = "kapeai";
-        saveConfig(config);
-        res.json({ ok: true, runtime: "kapeai", configured: true });
-    }));
-    app.post("/agent/codex/kapeai/clear", route(async (_req, res) => {
-        await clearKapeaiApiKey(emit);
-        config.codexRuntime = "subscription";
-        saveConfig(config);
-        res.json({ ok: true, runtime: "subscription" });
-    }));
+    app.get("/agent/runtime", (_req, res) => {
+        res.setHeader("Cache-Control", "no-store");
+        res.json({ ok: true, fingerprint: runtimeFingerprint, claim: runtimeClaim, busy: sessions.runtimeBusy });
+    });
+    app.post("/agent/runtime/handoff", (req, res) => {
+        if (req.headers.origin) return res.status(403).json({ ok: false, error: "browser handoff forbidden" });
+        const requestedFingerprint = String(req.body?.fingerprint || "");
+        if (!/^v1:[a-f0-9]{64}$/.test(requestedFingerprint)) return res.status(400).json({ ok: false, error: "invalid runtime fingerprint" });
+        if (requestedFingerprint === runtimeFingerprint) return res.json({ ok: true, handoff: false });
+        const requestedClaim = String(req.body?.claim || "");
+        if (!isRuntimeClaim(requestedClaim) || compareRuntimeClaims(requestedClaim, runtimeClaim) <= 0) return res.status(409).json({ ok: false, stale: true });
+        if (sessions.runtimeBusy) return res.status(409).json({ ok: false, busy: true });
+        if (!handoffAccepted) {
+            handoffAccepted = true;
+            res.once("finish", () => {
+                setImmediate(() => {
+                    handoffStop ||= stopHttpBridge(server, sessions, leases, waitForRequestDrain);
+                    void handoffStop.catch(() => logger.error("Sneeai Agent bridge handoff failed"));
+                });
+            });
+        }
+        return res.status(202).json({ ok: true, handoff: true });
+    });
     app.get("/agent/codex/threads", route(async (req, res) => {
-        const workspace = ensureSiteWorkspace(config);
-        const result = await listCodexThreads(emit, { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || ""), runtime: selectedRuntime(config) });
+        const authorization = requestAuthorization(req);
+        const workspace = workspaceFor(authorization.profile);
+        const result = await listCodexThreads(emitFor(authorization.profile), { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || ""), profileId: authorization.profile.key });
         res.json({ ok: true, workspace, ...result });
     }));
     app.post("/agent/codex/threads/new", route(async (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
-        const workspace = ensureSiteWorkspace(config);
-        const thread = await startCodexThread(emit, workspace.workspacePath, permissionMode(req.body?.permissionMode), selectedRuntime(config));
+        const authorization = requestAuthorization(req);
+        if (authorization.session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+        const workspace = workspaceFor(authorization.profile);
+        const thread = await codex.startThread(emitFor(authorization.profile), workspace.workspacePath, permissionMode(req.body?.permissionMode), authorization.profile.key);
         const activeThreadId = String((thread as Record<string, unknown>).id || "");
-        const nextWorkspace = setActiveThread(activeThreadId, { emptyThread: true });
+        const nextWorkspace = setActiveThread(authorization.profile, activeThreadId, { emptyThread: true });
         res.json({ ok: true, workspace: nextWorkspace, thread: summarizeCodexThread(thread), messages: [] });
     }));
     app.post("/agent/codex/threads/reset", (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
-        res.json({ ok: true, workspace: setActiveThread("", { emptyThread: true, draftThread: true }) });
+        const authorization = requestAuthorization(req);
+        if (authorization.session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+        res.json({ ok: true, workspace: setActiveThread(authorization.profile, "", { emptyThread: true, draftThread: true }) });
     });
     app.get("/agent/codex/threads/:threadId", route(async (req, res) => {
-        const workspace = ensureSiteWorkspace(config);
+        const authorization = requestAuthorization(req);
+        const workspace = workspaceFor(authorization.profile);
         const threadId = routeParam(req.params.threadId);
         try {
-            res.json({ ok: true, workspace, ...(await readCodexThread(emit, threadId, workspace.workspacePath, selectedRuntime(config))) });
+            res.json({ ok: true, workspace, ...(await readCodexThread(emitFor(authorization.profile), threadId, workspace.workspacePath, authorization.profile.key)) });
         } catch (error) {
             if (workspace.activeThreadId !== threadId || !isRecoverableThreadError(error)) throw error;
             res.json({ ok: true, workspace, thread: { id: threadId, preview: "", cwd: workspace.workspacePath }, messages: [] });
         }
     }));
     app.post("/agent/codex/threads/:threadId/resume", route(async (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
-        const workspace = ensureSiteWorkspace(config);
+        const authorization = requestAuthorization(req);
+        if (authorization.session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+        const workspace = workspaceFor(authorization.profile);
         const threadId = routeParam(req.params.threadId);
-        const result = await resumeCodexThread(emit, threadId, workspace.workspacePath, permissionMode(req.body?.permissionMode), selectedRuntime(config));
-        const nextWorkspace = setActiveThread(threadId);
+        const result = await resumeCodexThread(emitFor(authorization.profile), threadId, workspace.workspacePath, permissionMode(req.body?.permissionMode), authorization.profile.key);
+        const nextWorkspace = setActiveThread(authorization.profile, threadId);
         res.json({ ok: true, workspace: nextWorkspace, ...result });
     }));
     app.post("/agent/codex/threads/:threadId/delete", route(async (req, res) => {
-        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
-        const workspace = ensureSiteWorkspace(config);
+        const authorization = requestAuthorization(req);
+        if (authorization.session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+        const workspace = workspaceFor(authorization.profile);
         const threadId = routeParam(req.params.threadId);
-        await archiveCodexThread(emit, threadId, workspace.workspacePath, selectedRuntime(config));
-        setActiveThread(workspace.activeThreadId === threadId ? "" : workspace.activeThreadId || "");
+        await archiveCodexThread(emitFor(authorization.profile), threadId, workspace.workspacePath, authorization.profile.key);
+        setActiveThread(authorization.profile, workspace.activeThreadId === threadId ? "" : workspace.activeThreadId || "");
         res.json({ ok: true });
     }));
     app.post("/agent/codex/turn", route(async (req, res) => {
+        const authorization = requestAuthorization(req);
+        const session = authorization.session;
         if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
         const attachments = Array.isArray(req.body?.attachments) ? (req.body.attachments as AgentAttachment[]) : [];
-        const workspace = ensureSiteWorkspace(config);
+        const workspace = workspaceFor(authorization.profile);
         const prompt = String(req.body?.prompt || "");
         if (!prompt.trim()) return res.status(400).json({ ok: false, error: "请输入任务内容" });
-        const clientId = String(req.body?.clientId || "");
+        const clientId = authorizedClientId(authorization, String(req.body?.clientId || ""));
         logger.info("Codex turn accepted", { threadId: req.body?.threadId, promptLength: prompt.length, attachmentCount: attachments.length });
         session.setCodexState({ busy: true, threadId: String(req.body?.threadId || workspace.activeThreadId || ""), turnId: "" });
         try {
             let threadId = String(req.body?.threadId || workspace.activeThreadId || "");
             let turnId = "";
             if (!threadId) {
-                const thread = await startCodexThread(emit, workspace.workspacePath, permissionMode(req.body?.permissionMode), selectedRuntime(config));
+                const thread = await codex.startThread(emitFor(authorization.profile), workspace.workspacePath, permissionMode(req.body?.permissionMode), authorization.profile.key);
                 threadId = String((thread as Record<string, unknown>).id || "");
-                setActiveThread(threadId, { emptyThread: true });
+                setActiveThread(authorization.profile, threadId, { emptyThread: true });
             } else if (threadId !== workspace.activeThreadId) {
-                await verifyCodexThreadWorkspace(emit, threadId, workspace.workspacePath, selectedRuntime(config));
-                setActiveThread(threadId);
+                await verifyCodexThreadWorkspace(emitFor(authorization.profile), threadId, workspace.workspacePath, authorization.profile.key);
+                setActiveThread(authorization.profile, threadId);
             }
             const attachmentRefs = session.setTurnAttachments(clientId, attachments);
             const chatMessage = {
@@ -191,17 +520,17 @@ export function startHttpServer(openTarget?: string) {
                 const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
                 session.emitThread(type, threadId, { ...data, ...(turnId ? { turn_id: turnId } : {}) });
             };
-            void runCodexTurn(withAttachmentContext(prompt, attachmentRefs), turnEmit, attachments, {
+            void codex.runTurn(withAttachmentContext(prompt, attachmentRefs), turnEmit, attachments, {
                 threadId,
                 cwd: workspace.workspacePath,
+                profileId: authorization.profile.key,
                 permissionMode: permissionMode(req.body?.permissionMode),
-                runtime: selectedRuntime(config),
-                appEmit: emit,
+                appEmit: emitFor(authorization.profile),
                 onStart: clientId ? () => session.bindClient(clientId) : undefined,
                 onThread: (actualThreadId) => {
                     if (actualThreadId !== threadId) {
                         threadId = actualThreadId;
-                        setActiveThread(threadId, { emptyThread: true });
+                        setActiveThread(authorization.profile, threadId, { emptyThread: true });
                     }
                     session.setCodexState({ busy: true, threadId, turnId: "" });
                     if (chatThreadId !== threadId) {
@@ -230,71 +559,83 @@ export function startHttpServer(openTarget?: string) {
     app.post("/agent/codex/approval", route(async (req, res) => {
         const decision = String(req.body?.decision || "");
         if (!["accept", "acceptForSession", "decline", "cancel"].includes(decision)) return res.status(400).json({ ok: false, error: "无效的审批决定" });
-        const ok = await resolveCodexApproval(String(req.body?.requestId || ""), decision, selectedRuntime(config));
+        const ok = await resolveCodexApproval(String(req.body?.requestId || ""), decision);
         res.status(ok ? 200 : 409).json({ ok, ...(ok ? {} : { error: "审批请求已失效" }) });
     }));
-    app.post("/agent/codex/interrupt", route(async (req, res) => res.json({ ok: await interruptCodexTurn(String(req.body?.threadId || ""), selectedRuntime(config)) })));
+    app.post("/agent/codex/interrupt", route(async (req, res) => res.json({ ok: await interruptCodexTurn(String(req.body?.threadId || "")) })));
     app.post("/agent/claude/turn", (req, res) => {
-        runClaudeTurn(String(req.body?.prompt || ""), emit);
+        runClaudeTurn(String(req.body?.prompt || ""), emitFor(requestAuthorization(req).profile));
         res.json({ ok: true });
     });
     app.use((_req, res) => res.status(404).json({ ok: false, error: "not found" }));
     app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
         logger.error("HTTP request failed", { method: req.method, path: req.path, error });
-        res.status(500).json({ ok: false, error: error.message });
+        const providerBlocked = error instanceof CodexProviderPolicyError;
+        const apiKeyRequired = error instanceof CodexRelayApiKeyRequiredError;
+        const invalidInput = error instanceof CodexConnectionInputError;
+        const entitlementError = error instanceof EntitlementVerificationError;
+        const toolAuthorizationError = error instanceof ToolAuthorizationVerificationError;
+        const toolDecisionError = error instanceof CanvasToolDecisionError;
+        const status = providerBlocked ? 403 : apiKeyRequired || invalidInput || entitlementError || toolAuthorizationError || toolDecisionError ? error.statusCode : 500;
+        const code = providerBlocked ? "codex_provider_not_allowed" : apiKeyRequired ? "relay_api_key_required" : entitlementError || toolAuthorizationError || toolDecisionError ? error.code : "";
+        res.status(status).json({ ok: false, ...(code ? { code } : {}), ...((providerBlocked || apiKeyRequired) ? publicCodexConnection(config) : {}), error: error.message });
     });
 
-    app.listen(port, "127.0.0.1", () => {
-        console.log("Sneeai Agent");
-        console.log(`Local URL: ${config.url}`);
-        console.log(`Connect token: ${config.token}`);
-        console.log("Codex MCP is not installed by this command.");
-        console.log("Optional MCP add: codex mcp add sneeai-agent -- npx -y @sneeai/sneeai-agent@0.3.2 mcp");
-        console.log("Remove manually added MCP: codex mcp remove sneeai-agent");
-        if (logger.enabled) console.log(`Debug log: ${logger.filePath}`);
-        logger.info("Canvas Agent started", { url: config.url, workspace: ensureSiteWorkspace(config).workspacePath, debugLog: logger.filePath });
-        if (openTarget) void openCanvasUrl(openTarget, config.url, config.token);
-    });
-}
-
-/** 确保 MCP 进程拥有可用的普通 HTTP Agent；多个 MCP 进程共享同一个实例。 */
-export async function ensureHttpAgent() {
-    const current = loadConfig(false);
-    if (await agentReachable(current)) return current;
-    await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
-    const lockPath = path.join(CONFIG_DIR, "agent-start.lock");
-    let lock: Awaited<ReturnType<typeof openFile>> | null = null;
-    try {
-        lock = await openFile(lockPath, "wx");
-        await lock.writeFile(String(process.pid));
-    } catch {
-        if (await waitForAgent(current)) return loadConfig(false);
-        throw new Error("无法启动本地 Canvas Agent：已有启动进程未完成");
-    }
-    try {
-        if (await agentReachable(current)) return current;
-        const command = agentProcessCommand();
-        const child = spawn(command.command, command.args, { detached: true, stdio: "ignore", windowsHide: true });
-        child.unref();
-        if (!(await waitForAgent(current))) throw new Error("本地 Canvas Agent 启动超时");
-        return loadConfig(false);
-    } finally {
-        await lock.close().catch(() => undefined);
-        await unlink(lockPath).catch(() => undefined);
-    }
-}
-
-/** 打开画布时优先复用已经运行的本机 Agent，避免重复占用端口。 */
-export async function openCanvasWithRunningAgent(openTarget: string) {
-    const existing = loadConfig(false);
-    try {
-        const response = await fetch(`${existing.url.replace(/\/$/, "")}/config`, { signal: AbortSignal.timeout(800) });
-        if (response.ok) {
-            await openCanvasUrl(openTarget, existing.url, existing.token);
-            return;
+    server = app.listen(port, "127.0.0.1", () => {
+        if (!options.silent) {
+            console.log("Sneeai Agent");
+            console.log(`Local URL: ${config.url}`);
+            console.log(`Connect token: ${config.token}`);
+            console.log("Codex MCP is not installed by this command.");
+            console.log(`Optional MCP add: codex mcp add sneeai-agent -- npx -y @sneeai/sneeai-agent@${VERSION} mcp`);
+            console.log("Remove manually added MCP: codex mcp remove sneeai-agent");
+            if (logger.enabled) console.log(`Debug log: ${logger.filePath}`);
         }
-    } catch {}
-    startHttpServer(openTarget);
+        logger.info("Sneeai Agent started", { url: config.url, workspace: ensureSiteWorkspace(config).workspacePath, debugLog: logger.filePath });
+        if (options.openCanvasUrl) {
+            const url = canvasConnectionUrl(options.openCanvasUrl, config);
+            console.log(`Canvas URL: ${url}`);
+            void openExternalUrl(url).catch((error) => console.error(`无法自动打开画布，请手动访问上面的 Canvas URL：${error instanceof Error ? error.message : String(error)}`));
+        }
+    });
+    return server;
+}
+
+/** 等待 HTTP Server 确认监听成功，并将端口错误交给调用方处理。 */
+export function waitForHttpServer(server: Server) {
+    if (server.listening) return Promise.resolve(server);
+    return new Promise<Server>((resolve, reject) => {
+        const onListening = () => {
+            cleanup();
+            resolve(server);
+        };
+        const onError = (error: Error) => {
+            cleanup();
+            reject(error);
+        };
+        const cleanup = () => {
+            server.off("listening", onListening);
+            server.off("error", onError);
+        };
+        server.once("listening", onListening);
+        server.once("error", onError);
+    });
+}
+
+async function stopHttpBridge(server: Server, sessions: CanvasSessionRegistry, leases: EntitlementLeaseRegistry, waitForRequestDrain: () => Promise<void>) {
+    sessions.dispose();
+    leases.dispose();
+    await waitForRequestDrain();
+    await Promise.all([stopCodexApp(), closeHttpServer(server)]);
+}
+
+function closeHttpServer(server: Server) {
+    if (!server.listening) return Promise.resolve();
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+    return new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+    });
 }
 
 /** 将异步 Express 路由异常交给统一错误处理中间件。 */
@@ -311,8 +652,42 @@ function permissionMode(value: unknown): AgentPermissionMode {
     return value === "automatic" || value === "full" ? value : "request";
 }
 
-function selectedRuntime(config: CanvasAgentConfig): AgentCodexRuntime {
-    return config.codexRuntime === "kapeai" ? "kapeai" : "subscription";
+function headerValue(req: Request, name: string) {
+    const value = req.headers[name.toLowerCase()];
+    return Array.isArray(value) ? value[0] || "" : value || "";
+}
+
+function authorizedClientId(authorization: RequestAuthorization, requested: string) {
+    if (authorization.clientId && requested && authorization.clientId !== requested) throw new Error("invalid client id");
+    return authorization.clientId || requested;
+}
+
+function requestHasToolProtocol(req: Request) {
+    const version = headerValue(req, "x-canvas-agent-protocol-version");
+    const capabilities = headerValue(req, "x-canvas-agent-capabilities").split(",").map((value) => value.trim()).filter(Boolean);
+    return version === "1" && REQUIRED_TOOL_CAPABILITIES.every((capability) => capabilities.includes(capability));
+}
+
+async function verifyToolPermit(
+    req: Request,
+    authorization: RequestAuthorization,
+    clientId: string,
+    proposal: PendingToolProposal,
+    now: () => number,
+) {
+    if (!authorization.ticketAuthorization) throw new ToolAuthorizationVerificationError("tool_authorization_required", "Tool authorization is required");
+    const token = typeof req.body?.authorization === "string" ? req.body.authorization : "";
+    const claims = await verifyToolAuthorization(token, {
+        origin: authorization.origin,
+        profileId: proposal.authorization?.profileId || authorization.profile.id,
+        clientId,
+        deviceId: authorization.ticketAuthorization.deviceId,
+        subject: authorization.ticketAuthorization.subject,
+        authorizationVersion: authorization.ticketAuthorization.authorizationVersion,
+        operationId: proposal.operationId,
+        commitment: proposal.commitment,
+    }, { now: now() });
+    return { jti: claims.jti, expiresAt: claims.exp * 1000 };
 }
 
 /** 使用当前操作系统的文件管理器定位本地文件。 */
@@ -338,69 +713,36 @@ function requestUrl(req: Request, config: CanvasAgentConfig) {
     return new URL(req.originalUrl || req.url || "/", config.url);
 }
 
-/** 设置跨域响应头并记录通过 token 授权的来源。 */
+function publicCodexConnection(config: CanvasAgentConfig) {
+    const status = canvasCodexConnectionStatus(config);
+    return { codexMode: status.mode, relayBaseUrl: status.relayBaseUrl, hasRelayApiKey: status.hasRelayApiKey };
+}
+
+/** 设置跨域响应头，并在首次配对时锁定网页来源。 */
 function setCors(req: Request, res: Response, url: URL, config: CanvasAgentConfig) {
     const origin = req.headers.origin;
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Access-Control-Allow-Headers", "content-type,x-canvas-agent-token");
+    res.setHeader("Access-Control-Allow-Headers", "content-type,x-canvas-agent-token,x-canvas-agent-ticket,x-canvas-agent-entitlement,x-canvas-profile-id,x-canvas-client-id,x-canvas-agent-protocol-version,x-canvas-agent-capabilities");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Private-Network", "true");
+    if (origin) res.setHeader("Vary", "Origin");
     if (!origin || req.method === "OPTIONS" || url.pathname === "/health" || url.pathname === "/config") return true;
+    if (url.pathname === "/pair" || url.pathname === "/pairing/proof") return authorizeAutomaticPairing(origin, process.env.CANVAS_AGENT_PAIR_ORIGINS || "", config.origins || []);
     config.origins ||= [];
-    if (validToken(req, url, config.token) && !config.origins.includes(origin)) {
-        config.origins.push(origin);
-        saveConfig(config);
+    if (!config.origins.includes(origin)) {
+        const persistedOrigins = loadConfig().origins || [];
+        if (persistedOrigins.includes(origin)) config.origins = persistedOrigins;
     }
-    res.setHeader("Vary", "Origin");
-    return config.origins.includes(origin);
+    const previousCount = config.origins.length;
+    const allowed = authorizeRequestOrigin(config.origins, origin, validToken(req, config.token));
+    if (config.origins.length !== previousCount) saveConfig(config);
+    return allowed;
 }
 
-/** 校验请求查询参数或请求头中的连接 token。 */
-function validToken(req: Request, url: URL, token: string) {
+/** 只从请求头校验连接 token，避免凭据进入 URL 日志。 */
+function validToken(req: Request, token: string) {
     const header = req.headers["x-canvas-agent-token"];
-    return url.searchParams.get("token") === token || header === token || (Array.isArray(header) && header.includes(token));
-}
-
-/** 打开带 fragment 凭据的画布地址；token 不会进入云端 HTTP 请求。 */
-export async function openCanvasUrl(target: string, agentUrl: string, token: string) {
-    try {
-        const url = new URL(target);
-        const fragment = new URLSearchParams(url.hash.replace(/^#/, ""));
-        fragment.set("agentUrl", agentUrl);
-        fragment.set("agentToken", token);
-        url.hash = fragment.toString();
-        const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-        const child = spawn(command, [url.toString()], { detached: true, stdio: "ignore", shell: process.platform === "win32" });
-        child.once("spawn", () => child.unref());
-    } catch (error) {
-        logger.warn("Failed to open canvas URL", { error });
-    }
-}
-
-async function agentReachable(config: CanvasAgentConfig) {
-    try {
-        const response = await fetch(`${config.url.replace(/\/$/, "")}/config`, { signal: AbortSignal.timeout(250) });
-        return response.ok;
-    } catch {
-        return false;
-    }
-}
-
-async function waitForAgent(config: CanvasAgentConfig) {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-        if (await agentReachable(config)) return true;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return false;
-}
-
-function agentProcessCommand() {
-    const current = process.argv.find((arg) => /index\.(t|j)s$/.test(arg)) || "";
-    const entry = path.resolve(current || fileURLToPath(new URL("../index.js", import.meta.url)));
-    const tsx = path.join(path.dirname(entry), "..", "node_modules", "tsx", "dist", "cli.mjs");
-    return entry.endsWith(".ts")
-        ? { command: process.execPath, args: [tsx, entry, "agent"] }
-        : { command: process.execPath, args: [entry, "agent"] };
+    return header === token || (Array.isArray(header) && header.includes(token));
 }
 
 /** 向 Agent 提示词追加本轮图片附件引用说明。 */

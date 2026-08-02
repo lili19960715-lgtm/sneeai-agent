@@ -3,10 +3,13 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { VERSION, ensureKapeaiCodexConfig, type AgentCodexRuntime } from "../config.js";
+import { STABLE_USER_HOME, VERSION } from "../config.js";
 import { logger } from "../utils/logger.js";
+import { redactSensitiveText } from "../utils/logger.js";
 import { field, type JsonRecord } from "../utils/value.js";
 import type { CodexNotificationParams, CodexPlanUpdate, CodexRequestMethod, CodexRequestParams, CodexRequestResult, CodexTurnInput } from "./codex-protocol.js";
+import { enforceCodexProviderPolicy } from "./codex-provider-policy.js";
+import { CANVAS_AGENT_PROFILE_ENV, canvasCodexAppServerArgs, NESTED_CANVAS_MCP_ENV } from "./codex-runtime.js";
 import type { AgentEmit, AgentPermissionMode } from "./types.js";
 
 type AgentEvent = JsonRecord & { type: string; usage?: unknown };
@@ -17,6 +20,9 @@ type PendingDelta = { delta: string; itemType: string; params: ItemDeltaParams; 
 const canvasAgentMcp = canvasAgentMcpCommand();
 const require = createRequire(import.meta.url);
 const STREAM_UPDATE_INTERVAL_MS = 40;
+const STOP_TIMEOUT_MS = 1_500;
+const KILL_TIMEOUT_MS = 1_000;
+const MCP_STARTUP_TIMEOUT_SEC = 60;
 
 /** 封装 Codex app-server 的 JSON-RPC 通信与事件转换。 */
 export class CodexAppClient {
@@ -32,68 +38,83 @@ export class CodexAppClient {
     private pendingDeltas = new Map<string, PendingDelta>();
     private plansByTurn = new Map<string, CodexPlanUpdate>();
     private approvalRequests = new Map<string, { id: number; method: string; params: JsonRecord }>();
+    private stopping = false;
+    private stopPromise: Promise<void> | null = null;
 
     /** 保存 app-server 子进程和事件出口。 */
-    private constructor(private child: ChildProcess, private emit: AgentEmit, readonly runtime: AgentCodexRuntime) {}
+    private constructor(private child: ChildProcess, private emit: AgentEmit) {}
+
+    /** app-server 空闲复用到另一个 profile 时更新通知出口。 */
+    setEmitter(emit: AgentEmit) {
+        this.emit = emit;
+    }
 
     /** 启动并初始化 Codex app-server。 */
-    static async start(emit: AgentEmit, onExit: () => void, runtime: AgentCodexRuntime = "subscription") {
-        const env = { ...process.env };
-        if (runtime === "kapeai") {
-            env.CODEX_HOME = ensureKapeaiCodexConfig();
-        }
-        logger.info("Starting Codex app-server", { executable: process.execPath, codex: codexBin(), runtime });
-        const child = spawn(process.execPath, [codexBin(), "app-server", "--stdio"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env });
-        const client = new CodexAppClient(child, emit, runtime);
+    static async start(emit: AgentEmit, onExit: (client: CodexAppClient) => void, runtimeEnv: NodeJS.ProcessEnv = process.env) {
+        logger.info("Starting Codex app-server", { executable: process.execPath, codex: codexBin() });
+        const child = spawn(process.execPath, [codexBin(), ...canvasCodexAppServerArgs()], {
+            env: { ...runtimeEnv, HOME: STABLE_USER_HOME, ...(process.platform === "win32" ? { USERPROFILE: STABLE_USER_HOME } : {}), [NESTED_CANVAS_MCP_ENV]: "1" },
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+        });
+        const client = new CodexAppClient(child, emit);
         child.stdout?.on("data", (chunk) => client.read(chunk.toString()));
         child.stderr?.on("data", (chunk) => {
-            const text = chunk.toString();
-            logger.warn("Codex app-server stderr", { text });
-            emit("agent_log", { text });
+            if (client.stopping) return;
+            logger.warn("Codex app-server stderr", { text: redactSensitiveText(chunk.toString()) });
         });
         child.on("error", (error) => {
+            if (client.stopping) return;
             logger.error("Codex app-server process error", error);
-            emit("agent_error", { message: error.message });
+            client.failAll("Codex app-server process failed");
+            emit("agent_error", { message: "Codex app-server 进程异常" });
         });
-        child.on("exit", (code) => {
-            logger.warn("Codex app-server exited", { code });
-            client.failAll(`Codex app-server exited: ${code ?? 0}`);
-            onExit();
-            emit("agent_log", { text: `Codex app-server exited: ${code ?? 0}` });
+        child.on("exit", (code, signal) => {
+            if (client.stopping) {
+                logger.info("Codex app-server stopped", { code, signal });
+            } else {
+                logger.warn("Codex app-server exited", { code, signal });
+                client.failAll(`Codex app-server exited: ${code ?? 0}`);
+                emit("agent_log", { text: `Codex app-server exited: ${code ?? 0}` });
+            }
+            onExit(client);
         });
-        await client.request("initialize", { clientInfo: { name: "sneeai-agent", title: "Sneeai Agent", version: VERSION }, capabilities: { experimentalApi: true, requestAttestation: false } });
-        client.notify("initialized");
-        return client;
+        try {
+            await client.request("initialize", { clientInfo: { name: "canvas-agent", title: "Sneeai Agent", version: VERSION }, capabilities: { experimentalApi: true, requestAttestation: false } });
+            client.notify("initialized");
+            const [account, effectiveConfig] = await Promise.all([
+                client.request("account/read", { refreshToken: false }),
+                client.request("config/read", { includeLayers: false }),
+            ]);
+            enforceCodexProviderPolicy({ account: account.account, config: effectiveConfig.config, env: runtimeEnv });
+            return client;
+        } catch (error) {
+            await client.stop();
+            throw error;
+        }
     }
 
-    /** 读取当前运行环境的 Codex 账户状态，不返回 token、邮箱或密钥。 */
-    readAccount() {
-        return this.request("account/read", { refreshToken: false });
+    /** 幂等停止 app-server，超时后升级为 SIGKILL。 */
+    stop(timeoutMs = STOP_TIMEOUT_MS) {
+        this.stopPromise ||= this.stopNow(timeoutMs);
+        return this.stopPromise;
     }
 
-    /** 让隔离的 KapeAI Codex 家目录接管 API key 持久化。 */
-    loginWithApiKey(apiKey: string) {
-        if (this.runtime !== "kapeai") throw new Error("API key 只能配置到 Agent 专用运行环境");
-        const value = apiKey.trim();
-        if (!value || value.length > 512 || /[\r\n]/.test(value)) throw new Error("API key 格式无效");
-        return this.request("account/login/start", { type: "apiKey", apiKey: value });
-    }
-
-    logout() {
-        if (this.runtime !== "kapeai") throw new Error("只能清除 Agent 专用 API 配置");
-        return this.request("account/logout", {});
+    /** stop 的资源释放别名。 */
+    dispose(timeoutMs = STOP_TIMEOUT_MS) {
+        return this.stop(timeoutMs);
     }
 
     /** 创建新的 Codex 线程。 */
-    async startThread(cwd?: string, permissionMode: AgentPermissionMode = "request") {
-        const { thread } = await this.request("thread/start", { ...threadSettings(permissionMode), ...(cwd ? { cwd } : {}), threadSource: "user" });
+    async startThread(cwd?: string, permissionMode: AgentPermissionMode = "request", profileId?: string) {
+        const { thread } = await this.request("thread/start", { ...threadSettings(permissionMode, profileId), ...(cwd ? { cwd } : {}), threadSource: "user" });
         if (!thread.id) throw new Error("Codex app-server 没有返回 thread id");
         return thread;
     }
 
     /** 恢复已有 Codex 线程。 */
-    async resumeThread(threadId: string, cwd?: string, permissionMode: AgentPermissionMode = "request") {
-        const { thread } = await this.request("thread/resume", { threadId, ...threadSettings(permissionMode), ...(cwd ? { cwd } : {}) });
+    async resumeThread(threadId: string, cwd?: string, permissionMode: AgentPermissionMode = "request", profileId?: string) {
+        const { thread } = await this.request("thread/resume", { threadId, ...threadSettings(permissionMode, profileId), ...(cwd ? { cwd } : {}) });
         if (!thread.id) throw new Error("Codex app-server 没有返回 thread id");
         return thread;
     }
@@ -174,6 +195,7 @@ export class CodexAppClient {
 
     /** 发送 JSON-RPC 请求并保存待处理 Promise。 */
     private request<Method extends CodexRequestMethod>(method: Method, params: CodexRequestParams<Method>) {
+        if (this.stopping) return Promise.reject(new Error("Codex app-server is stopping")) as Promise<CodexRequestResult<Method>>;
         const id = this.nextId++;
         this.write({ id, method, params });
         return new Promise<CodexRequestResult<Method>>((resolve, reject) => this.pending.set(id, { resolve: (result) => resolve(result as CodexRequestResult<Method>), reject }));
@@ -201,8 +223,8 @@ export class CodexAppClient {
             try {
                 this.handle(JSON.parse(line) as JsonRecord);
             } catch (error) {
-                logger.warn("Invalid Codex app-server output", { error, line });
-                this.emit("agent_log", { text: line });
+                logger.warn("Invalid Codex app-server output", { error, line: redactSensitiveText(line) });
+                this.emit("agent_log", { text: "Codex 返回了无法解析的诊断信息" });
             }
         });
     }
@@ -352,9 +374,36 @@ export class CodexAppClient {
         this.currentThreadId = "";
         this.currentTurnId = "";
     }
+
+    private async stopNow(timeoutMs: number) {
+        this.stopping = true;
+        this.failAll("Codex app-server stopped");
+        if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+        const exited = waitForChildExit(this.child, Math.max(0, timeoutMs));
+        this.child.stdin?.end();
+        this.child.kill("SIGTERM");
+        if (await exited) return;
+        this.child.kill("SIGKILL");
+        await waitForChildExit(this.child, KILL_TIMEOUT_MS);
+    }
 }
 
-/** 生成 Codex 调用 Canvas Agent MCP 的启动命令。 */
+function waitForChildExit(child: ChildProcess, timeoutMs: number) {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+        const onExit = () => {
+            clearTimeout(timer);
+            resolve(true);
+        };
+        const timer = setTimeout(() => {
+            child.off("exit", onExit);
+            resolve(false);
+        }, timeoutMs);
+        child.once("exit", onExit);
+    });
+}
+
+/** 生成 Codex 调用 Sneeai Agent MCP 的启动命令。 */
 function canvasAgentMcpCommand() {
     const current = process.argv.find((arg) => /index\.(t|j)s$/.test(arg)) || "";
     const entry = path.resolve(current || fileURLToPath(new URL("../index.js", import.meta.url)));
@@ -363,12 +412,18 @@ function canvasAgentMcpCommand() {
 }
 
 /** 生成 Codex app-server 使用的 MCP 配置。 */
-function codexConfig(permissionMode: AgentPermissionMode) {
-    return { model_reasoning_summary: "auto", ...(permissionMode === "automatic" ? { approvals_reviewer: "auto_review" } : {}), mcp_servers: { "sneeai-agent": { command: canvasAgentMcp.command, args: canvasAgentMcp.args, default_tools_approval_mode: "approve", startup_timeout_sec: 20, tool_timeout_sec: 90 } } };
+export function codexConfig(permissionMode: AgentPermissionMode, profileId?: string) {
+    const nestedEnvironment = {
+        [NESTED_CANVAS_MCP_ENV]: "1",
+        CANVAS_AGENT_HOME: STABLE_USER_HOME,
+        ...(process.env.PORT ? { PORT: process.env.PORT } : {}),
+        ...(profileId ? { [CANVAS_AGENT_PROFILE_ENV]: profileId } : {}),
+    };
+    return { model_reasoning_summary: "auto", ...(permissionMode === "automatic" ? { approvals_reviewer: "auto_review" } : {}), mcp_servers: { "sneeai-agent": { command: canvasAgentMcp.command, args: canvasAgentMcp.args, env: nestedEnvironment, default_tools_approval_mode: "approve", startup_timeout_sec: MCP_STARTUP_TIMEOUT_SEC, tool_timeout_sec: 90, required: true } } };
 }
 
-function threadSettings(permissionMode: AgentPermissionMode) {
-    return { approvalPolicy: permissionMode === "full" ? "never" as const : "on-request" as const, sandbox: permissionMode === "full" ? "danger-full-access" as const : "workspace-write" as const, config: codexConfig(permissionMode) };
+function threadSettings(permissionMode: AgentPermissionMode, profileId?: string) {
+    return { approvalPolicy: permissionMode === "full" ? "never" as const : "on-request" as const, sandbox: permissionMode === "full" ? "danger-full-access" as const : "workspace-write" as const, config: codexConfig(permissionMode, profileId) };
 }
 
 function turnSettings(permissionMode: AgentPermissionMode) {

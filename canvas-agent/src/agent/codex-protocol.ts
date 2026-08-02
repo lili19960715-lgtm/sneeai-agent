@@ -27,16 +27,12 @@ type CodexRequestSpec = {
         result: JsonRecord;
     };
     "account/read": {
-        params: { refreshToken: boolean };
-        result: { account: { type?: string; planType?: string | null; credentialSource?: string | null } | null; requiresOpenaiAuth?: boolean };
+        params: { refreshToken?: boolean };
+        result: { account: { type?: string } | null; requiresOpenaiAuth: boolean };
     };
-    "account/login/start": {
-        params: { type: "apiKey"; apiKey: string };
-        result: { type?: string };
-    };
-    "account/logout": {
-        params: Record<string, never>;
-        result: Record<string, never>;
+    "config/read": {
+        params: { includeLayers?: boolean; cwd?: string | null };
+        result: { config: JsonRecord; origins: JsonRecord; layers?: unknown[] | null };
     };
     "thread/start": {
         params: ThreadOptions & { threadSource: "user" };

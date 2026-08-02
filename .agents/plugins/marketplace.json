@@ -1,11 +1,11 @@
 {
   "name": "sneeai",
   "interface": {
-    "displayName": "Sneeai Agent"
+    "displayName": "Sneeai"
   },
   "plugins": [
     {
-      "name": "sneeai-agent",
+      "name": "sneeai",
       "source": {
         "source": "local",
         "path": "./plugins/infinite-canvas"

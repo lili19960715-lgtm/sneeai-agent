@@ -1,0 +1,37 @@
+{
+  "name": "@sneeai/sneeai-codex-bridge",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "bin": {
+    "sneeai-codex-bridge": "dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/local-agent.test.ts",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://sneeai.com/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sneeai/sneeai-agent.git",
+    "directory": "plugin-bridge"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

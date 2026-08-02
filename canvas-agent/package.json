@@ -1,6 +1,6 @@
 {
   "name": "@sneeai/sneeai-agent",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,8 +15,9 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "debug": "tsx src/index.ts --debug",
-    "test": "tsx --test src/canvas/session.test.ts src/agent/codex-account.test.ts",
-    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
+    "test": "tsx --test --test-concurrency=1 src/agent/codex-client.test.ts src/agent/codex-history.test.ts src/agent/codex-provider-policy.test.ts src/agent/codex-runtime.test.ts src/canvas/session.test.ts src/canvas/session-registry.test.ts src/config.test.ts src/entitlement.test.ts src/entitlement-lease.test.ts src/pairing.test.ts src/pairing-ticket.test.ts src/profile.test.ts src/protocol.test.ts src/tool-authorization.test.ts src/server/cors.test.ts src/server/entitlement-http.test.ts src/server/local-file-capabilities.test.ts src/server/runtime.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "prepack": "npm run build"
   },

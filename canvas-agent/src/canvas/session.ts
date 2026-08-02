@@ -2,17 +2,57 @@ import crypto from "node:crypto";
 import type { ServerResponse } from "node:http";
 
 import type { AgentAttachment } from "../agent/types.js";
+import { ToolAuthorizationReplayGuard } from "../tool-authorization.js";
 import { logger } from "../utils/logger.js";
 import { buildCanvasToolRequest, fitAttachmentNodeSize } from "./operations.js";
 import type { ToolName } from "./schemas.js";
 import { compactCanvasState, compactNode, isToolName, nextCanvasX, parseToolInput } from "./tools.js";
 import type { CanvasSnapshot } from "./types.js";
 
-type PendingRequest = { clientId: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
+type ToolOperationState = "proposed" | "authorized" | "dispatched";
+type ClientConnection = { response: ServerResponse; connectionId: string; authorization?: CanvasClientAuthorization };
+type PendingRequest = {
+    operationId: string;
+    clientId: string;
+    connectionId: string;
+    state: ToolOperationState;
+    originalName: ToolName;
+    originalInput: Record<string, unknown>;
+    dispatchName: ToolName;
+    dispatchInput: Record<string, unknown>;
+    authorization?: CanvasClientAuthorization;
+    authorizationJti?: string;
+    commitment?: string;
+    timer?: ReturnType<typeof setTimeout>;
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+};
 type TurnAttachment = { clientId: string; id: string; name: string; type: string; size: number; width: number; height: number; dataUrl: string };
 export type CodexState = { busy: boolean; threadId: string; turnId: string };
+export type CanvasClientAuthorization = {
+    origin: string;
+    profileId: string;
+    profileKey: string;
+    clientId: string;
+    subject: string;
+    deviceId: string;
+    authorizationVersion: number;
+    expiresAt: number;
+};
+export type PendingToolProposal = {
+    protocol: "tool.authorization.v1";
+    operationId: string;
+    operationClass: "agent_write";
+    commitment: string;
+    name: ToolName;
+    input: Record<string, unknown>;
+    dispatchName?: ToolName;
+    dispatchInput?: Record<string, unknown>;
+    authorization?: CanvasClientAuthorization;
+};
+export type VerifiedToolAuthorization = { jti: string; expiresAt: number };
 
-const SITE_TOOLS = new Set<ToolName>([
+const DIRECT_SITE_TOOLS = new Set<ToolName>([
     "site_navigate",
     "canvas_list_projects",
     "workbench_image_get_config",
@@ -24,10 +64,34 @@ const SITE_TOOLS = new Set<ToolName>([
     "assets_add",
     "generation_get_status",
 ]);
+export const READ_ONLY_TOOL_NAMES = Object.freeze([
+    "site_navigate",
+    "canvas_list_projects",
+    "canvas_get_state",
+    "canvas_get_selection",
+    "canvas_export_snapshot",
+    "canvas_select_nodes",
+    "canvas_set_viewport",
+    "generation_get_status",
+    "workbench_image_get_config",
+    "workbench_video_get_config",
+    "prompts_search",
+    "assets_list",
+]) as readonly ToolName[];
+const READ_ONLY_TOOLS = new Set<ToolName>(READ_ONLY_TOOL_NAMES);
+const TOOL_REQUEST_TIMEOUT_MS = 30_000;
+
+export class CanvasToolDecisionError extends Error {
+    constructor(readonly code: string, message: string, readonly statusCode = 409) {
+        super(message);
+        this.name = "CanvasToolDecisionError";
+    }
+}
 
 /** 管理网页画布连接、状态、附件和工具请求。 */
 export class CanvasSession {
-    private clients = new Map<string, ServerResponse>();
+    private clients = new Map<string, ClientConnection>();
+    private eventStreams = new Map<ServerResponse, ReturnType<typeof setInterval>>();
     private clientFocusOrder = new Map<string, number>();
     private pending = new Map<string, PendingRequest>();
     private canvasStates = new Map<string, CanvasSnapshot>();
@@ -36,6 +100,13 @@ export class CanvasSession {
     private boundClientId = "";
     private focusSequence = 0;
     private codexState: CodexState = { busy: false, threadId: "", turnId: "" };
+    private codexOperations = 0;
+    private disposed = false;
+    private readonly replayGuard: ToolAuthorizationReplayGuard;
+
+    constructor(private readonly options: { now?: () => number; requestTimeoutMs?: number; replayGuard?: ToolAuthorizationReplayGuard } = {}) {
+        this.replayGuard = options.replayGuard || new ToolAuthorizationReplayGuard();
+    }
 
     /** 获取当前目标网页的画布状态。 */
     private get canvasState() {
@@ -47,7 +118,7 @@ export class CanvasSession {
         return this.boundClientId || this.activeClientId;
     }
 
-    /** 返回 Canvas Agent 当前连接状态。 */
+    /** 返回 Sneeai Agent 当前连接状态。 */
     health() {
         return { ok: true, hasCanvas: Boolean(this.canvasState), clients: this.clients.size, codexBusy: this.codexState.busy };
     }
@@ -55,6 +126,22 @@ export class CanvasSession {
     /** 返回 Codex 是否正在执行任务。 */
     get codexBusy() {
         return this.codexState.busy;
+    }
+
+    /** 交接只允许在 turn 和线程管理 RPC 都空闲时发生。 */
+    get runtimeBusy() {
+        return this.codexState.busy || this.codexOperations > 0;
+    }
+
+    /** 标记一个可能启动或调用 app-server 的 HTTP 请求，并返回幂等释放函数。 */
+    beginCodexOperation() {
+        this.codexOperations += 1;
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.codexOperations = Math.max(0, this.codexOperations - 1);
+        };
     }
 
     /** 更新并广播 Codex 运行状态。 */
@@ -66,14 +153,21 @@ export class CanvasSession {
         this.emitAll("codex_state", this.codexState);
     }
 
-    /** 建立网页与 Canvas Agent 之间的 SSE 连接。 */
-    openEvents(url: URL, res: ServerResponse) {
-        const clientId = url.searchParams.get("clientId") || crypto.randomUUID();
+    /** 建立网页与 Sneeai Agent 之间的 SSE 连接。 */
+    openEvents(url: URL, res: ServerResponse, authenticatedClientId = "", authorization?: CanvasClientAuthorization) {
+        if (this.disposed) {
+            res.writeHead(503);
+            res.end();
+            return;
+        }
+        const clientId = authenticatedClientId || url.searchParams.get("clientId") || crypto.randomUUID();
         const statusOnly = url.searchParams.get("role") === "status";
         logger.info("SSE client connected", { clientId, statusOnly });
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         if (!statusOnly) {
-            this.clients.set(clientId, res);
+            const previous = this.clients.get(clientId);
+            if (previous && previous.response !== res) this.rejectClientPending(clientId, previous.connectionId, "请求页面已重新连接");
+            this.clients.set(clientId, { response: res, connectionId: crypto.randomUUID(), ...(authorization ? { authorization: { ...authorization, clientId } } : {}) });
             if (!this.clientFocusOrder.has(clientId)) this.clientFocusOrder.set(clientId, 0);
             if (!this.activeClientId) {
                 this.activeClientId = clientId;
@@ -82,21 +176,43 @@ export class CanvasSession {
         }
         sendEvent(res, "hello", { ok: true, clientId, codex: this.codexState });
         const timer = setInterval(() => sendEvent(res, "ping", { time: Date.now() }), 15000);
+        this.eventStreams.set(res, timer);
         res.on("close", () => {
             clearInterval(timer);
+            this.eventStreams.delete(res);
             logger.info("SSE client disconnected", { clientId, statusOnly });
-            if (statusOnly || this.clients.get(clientId) !== res) return;
+            const connection = this.clients.get(clientId);
+            if (statusOnly || connection?.response !== res) return;
             this.clients.delete(clientId);
             this.clientFocusOrder.delete(clientId);
             this.canvasStates.delete(clientId);
             if (this.boundClientId === clientId) this.boundClientId = "";
-            this.pending.forEach((item, requestId) => {
-                if (item.clientId !== clientId) return;
-                this.pending.delete(requestId);
-                item.reject(new Error("请求页面已断开"));
-            });
+            this.rejectClientPending(clientId, connection.connectionId, "请求页面已断开");
             if (this.activeClientId === clientId) this.activeClientId = [...this.clients.keys()].sort((a, b) => (this.clientFocusOrder.get(b) || 0) - (this.clientFocusOrder.get(a) || 0))[0] || "";
         });
+    }
+
+    /** 关闭全部 SSE，并拒绝交接时仍待处理的画布请求。 */
+    dispose(reason = "Sneeai Agent bridge is restarting") {
+        if (this.disposed) return;
+        this.disposed = true;
+        this.pending.forEach((item) => {
+            if (item.timer) clearTimeout(item.timer);
+            item.reject(new Error(reason));
+        });
+        this.pending.clear();
+        this.eventStreams.forEach((timer, response) => {
+            clearInterval(timer);
+            if (!response.writableEnded) response.end();
+        });
+        this.eventStreams.clear();
+        this.clients.clear();
+        this.clientFocusOrder.clear();
+        this.canvasStates.clear();
+        this.turnAttachments.clear();
+        this.codexOperations = 0;
+        this.activeClientId = "";
+        this.boundClientId = "";
     }
 
     /** 保存指定网页上报的最新画布快照。 */
@@ -168,8 +284,9 @@ export class CanvasSession {
     /** 接收网页返回的工具调用结果。 */
     resolveResult(clientId: string, body: { requestId?: string; error?: string; result?: unknown }) {
         const item = body.requestId ? this.pending.get(body.requestId) : null;
-        if (!item || !body.requestId || item.clientId !== clientId) return false;
+        if (!item || !body.requestId || item.clientId !== clientId || item.state !== "dispatched") return false;
         this.pending.delete(body.requestId);
+        if (item.timer) clearTimeout(item.timer);
         logger.debug("Canvas tool result received", { clientId, requestId: body.requestId, error: body.error, result: body.result });
         body.error ? item.reject(new Error(body.error)) : item.resolve(body.result);
         return true;
@@ -177,7 +294,7 @@ export class CanvasSession {
 
     /** 向全部已连接网页广播事件。 */
     emitAll(type: string, payload: unknown) {
-        this.clients.forEach((client) => sendEvent(client, type, payload));
+        this.clients.forEach((client) => sendEvent(client.response, type, payload));
     }
 
     /** 向全部网页广播带线程归属的事件。 */
@@ -190,12 +307,12 @@ export class CanvasSession {
         if (!isToolName(name)) throw new Error(`未知工具：${String(name)}`);
         logger.info("MCP tool called", { name, input: rawInput, targetClientId: this.targetClientId });
         const input = parseToolInput(name, rawInput) as Record<string, unknown>;
-        if (SITE_TOOLS.has(name)) {
+        if (DIRECT_SITE_TOOLS.has(name)) {
             if (!this.clients.size) throw new Error("当前没有已连接网页");
-            return await this.requestCanvasTool(name, input);
+            return await this.requestCanvasTool(name, input, name, input);
         }
-        const readTool = ["canvas_get_state", "canvas_get_selection", "canvas_export_snapshot"].includes(name);
-        if (readTool && (!this.clients.size || !this.canvasState)) throw new Error("当前没有已连接画布");
+        const snapshotReadTool = name === "canvas_get_state" || name === "canvas_get_selection" || name === "canvas_export_snapshot";
+        if (snapshotReadTool && (!this.clients.size || !this.canvasState)) throw new Error("当前没有已连接画布");
         if (name === "canvas_get_state" || name === "canvas_export_snapshot") return compactCanvasState(this.canvasState);
         if (name === "canvas_get_selection") {
             const ids = new Set(this.canvasState?.selectedNodeIds || []);
@@ -204,7 +321,60 @@ export class CanvasSession {
         if (name === "canvas_create_attachment_nodes") return await this.createAttachmentNodes(input as { attachmentIds: string[]; x?: number; y?: number; gap?: number; direction?: "row" | "column" });
         if (!this.clients.size) throw new Error("当前没有已连接画布");
         const request = buildCanvasToolRequest(name, input, this.canvasState);
-        return await this.requestCanvasTool(request.name, request.input);
+        return await this.requestCanvasTool(name, input, request.name, request.input);
+    }
+
+    /** 消费网页对单个写工具 proposal 的决定。 */
+    async decideTool(
+        clientId: string,
+        decision: { operationId: string; decision: "approve" | "reject"; error?: string },
+        verify: (proposal: PendingToolProposal) => Promise<VerifiedToolAuthorization>,
+    ) {
+        const item = this.pending.get(decision.operationId);
+        if (!item || item.clientId !== clientId || item.state !== "proposed") return false;
+        const connection = this.clients.get(clientId);
+        if (!connection || connection.connectionId !== item.connectionId) {
+            this.failPending(item, new Error("请求页面已断开"));
+            return false;
+        }
+        if (decision.decision === "reject") {
+            this.failPending(item, new Error(decision.error?.trim() || "网页拒绝了画布操作"));
+            return true;
+        }
+
+        let permit: VerifiedToolAuthorization;
+        try {
+            permit = await verify({
+                protocol: "tool.authorization.v1",
+                operationId: item.operationId,
+                operationClass: "agent_write",
+                commitment: item.commitment || "",
+                name: item.originalName,
+                input: item.originalInput,
+                authorization: item.authorization ? { ...item.authorization } : undefined,
+            });
+        } catch (error) {
+            if (this.pending.get(item.operationId) === item && item.state === "proposed") {
+                this.failPending(item, error instanceof Error ? error : new Error("工具许可验证失败"));
+            }
+            throw error;
+        }
+
+        if (this.pending.get(item.operationId) !== item || item.state !== "proposed") return false;
+        if (!permit.jti || !Number.isFinite(permit.expiresAt) || permit.expiresAt <= this.now()) {
+            const error = new CanvasToolDecisionError("tool_authorization_invalid", "Tool authorization is invalid", 403);
+            this.failPending(item, error);
+            throw error;
+        }
+        if (!this.replayGuard.consume(permit.jti, permit.expiresAt, this.now())) {
+            const error = new CanvasToolDecisionError("tool_authorization_replayed", "Tool authorization has already been used");
+            this.failPending(item, error);
+            throw error;
+        }
+
+        item.state = "authorized";
+        item.authorizationJti = permit.jti;
+        return this.dispatchPending(item);
     }
 
     /** 将当前 turn 的附件转换为画布图片节点。 */
@@ -230,26 +400,99 @@ export class CanvasSession {
             offset += (direction === "row" ? size.width : size.height) + gap;
             return node;
         });
-        await this.requestCanvasTool("canvas_create_attachment_nodes", { nodes });
+        await this.requestCanvasTool("canvas_create_attachment_nodes", input, "canvas_create_attachment_nodes", { nodes });
         return { nodes: nodes.map(({ id, attachmentId, title }) => ({ id, attachmentId, title })) };
     }
 
-    /** 向目标网页发送工具请求并等待调用结果。 */
-    private async requestCanvasTool(name: ToolName, input: Record<string, unknown>) {
-        const requestId = crypto.randomUUID();
+    /** 为工具请求创建 pending 状态；只读立即分派，写操作先发送 proposal。 */
+    private requestCanvasTool(originalName: ToolName, originalInput: Record<string, unknown>, dispatchName: ToolName, dispatchInput: Record<string, unknown>) {
+        const operationId = crypto.randomUUID();
         const clientId = this.targetClientId;
-        const client = this.clients.get(clientId);
-        if (!client) throw new Error("当前没有已连接画布");
-        sendEvent(client, "tool_call", { requestId, name, input });
-        logger.debug("Canvas tool request sent", { requestId, name, input, clientId });
-        return await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this.pending.delete(requestId);
-                logger.warn("Canvas tool request timed out", { requestId, name, clientId });
-                reject(new Error("画布操作超时"));
-            }, 30000);
-            this.pending.set(requestId, { clientId, resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
+        const connection = this.clients.get(clientId);
+        if (!connection) throw new Error("当前没有已连接画布");
+        const readOnly = READ_ONLY_TOOLS.has(originalName);
+        return new Promise<unknown>((resolve, reject) => {
+            const commitment = readOnly ? "" : crypto.randomBytes(32).toString("base64url");
+            const item: PendingRequest = {
+                operationId,
+                clientId,
+                connectionId: connection.connectionId,
+                state: readOnly ? "dispatched" : "proposed",
+                originalName,
+                originalInput,
+                dispatchName,
+                dispatchInput,
+                authorization: connection.authorization ? { ...connection.authorization } : undefined,
+                resolve,
+                reject,
+                ...(commitment ? { commitment } : {}),
+            };
+            item.timer = this.pendingTimer(item);
+            this.pending.set(operationId, item);
+            if (readOnly) {
+                sendEvent(connection.response, "tool_call", { requestId: operationId, name: dispatchName, input: dispatchInput });
+                logger.debug("Canvas read-only tool request sent", { requestId: operationId, name: dispatchName, clientId });
+                return;
+            }
+            sendEvent(connection.response, "tool_proposal", {
+                protocol: "tool.authorization.v1",
+                operationId,
+                operationClass: "agent_write",
+                commitment,
+                name: originalName,
+                input: originalInput,
+                dispatchName,
+                dispatchInput,
+                ...(connection.authorization ? { authorization: { ...connection.authorization } } : {}),
+            });
+            logger.debug("Canvas tool proposal sent", { operationId, name: originalName, clientId });
         });
+    }
+
+    private dispatchPending(item: PendingRequest) {
+        const connection = this.clients.get(item.clientId);
+        if (!connection || connection.connectionId !== item.connectionId || item.state !== "authorized") {
+            this.failPending(item, new Error("请求页面已断开"));
+            return false;
+        }
+        item.state = "dispatched";
+        if (item.timer) clearTimeout(item.timer);
+        item.timer = this.pendingTimer(item);
+        sendEvent(connection.response, "tool_call", {
+            requestId: item.operationId,
+            name: item.dispatchName,
+            input: item.dispatchInput,
+            ...(item.authorizationJti ? { authorizationJti: item.authorizationJti } : {}),
+        });
+        logger.debug("Authorized Canvas tool request sent", { requestId: item.operationId, name: item.dispatchName, clientId: item.clientId, authorizationJti: item.authorizationJti });
+        return true;
+    }
+
+    private pendingTimer(item: PendingRequest) {
+        return setTimeout(() => {
+            if (this.pending.get(item.operationId) !== item) return;
+            this.pending.delete(item.operationId);
+            const proposed = item.state === "proposed";
+            logger.warn("Canvas tool request timed out", { requestId: item.operationId, name: item.originalName, clientId: item.clientId, state: item.state });
+            item.reject(new Error(proposed ? "画布操作许可超时" : "画布操作超时"));
+        }, this.options.requestTimeoutMs ?? TOOL_REQUEST_TIMEOUT_MS);
+    }
+
+    private failPending(item: PendingRequest, error: Error) {
+        if (this.pending.get(item.operationId) !== item) return;
+        this.pending.delete(item.operationId);
+        if (item.timer) clearTimeout(item.timer);
+        item.reject(error);
+    }
+
+    private rejectClientPending(clientId: string, connectionId: string, reason: string) {
+        this.pending.forEach((item) => {
+            if (item.clientId === clientId && item.connectionId === connectionId) this.failPending(item, new Error(reason));
+        });
+    }
+
+    private now() {
+        return (this.options.now || Date.now)();
     }
 }
 

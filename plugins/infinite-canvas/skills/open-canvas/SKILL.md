@@ -1,6 +1,6 @@
 ---
 name: open-canvas
-description: 打开 SneeAI 在线或本地画布，并自动连接本地 Sneeai Agent。用户要求打开、启动、进入或使用 SneeAI 画布时使用。
+description: 打开 SneeAI 在线或本地画布，并连接用户已安装的本机 Sneeai Agent。用户要求打开、启动、进入或使用 SneeAI 画布时使用。
 ---
 
 # Open SneeAI Canvas
@@ -9,45 +9,35 @@ description: 打开 SneeAI 在线或本地画布，并自动连接本地 Sneeai 
 
 ## 在线版
 
-1. 启动本地 Canvas Agent 并保持运行：
-
-```bash
-npx -y @sneeai/sneeai-agent@0.3.2 open "https://sneeai.com/canvas?mode=new"
-```
-
-2. 从启动输出取得 `Local URL` 和 `Connect token`。
-
-3. 在 Codex 右侧浏览器打开：
+1. 在浏览器打开：
 
 ```text
-https://sneeai.com/canvas?mode=new#agentUrl=<Local URL>&agentToken=<Connect token>
+https://sneeai.com/canvas?mode=new
 ```
+
+2. 网页会自动发现已经运行的本机 Sneeai Agent，并通过网站授权完成配对。
+
+3. Agent 未安装、未启动或版本不兼容时，告知用户先在 SneeAI 下载页安装或更新 Agent；不要自行通过 npm 下载、升级或启动 Agent。
 
 ## 本地版
 
-1. 在 Infinite Canvas 项目中启动前端，并使用 Vite 输出的 `Local` 地址：
+1. 在 SneeAI 项目中启动前端，并使用 Vite 输出的 `Local` 地址：
 
 ```bash
 cd web
-bun install
-bun run dev
+pnpm install
+pnpm dev
 ```
 
-2. 启动本地 Canvas Agent：
-
-```bash
-npx -y @sneeai/sneeai-agent@0.3.2 open "<Vite Local 地址>/canvas?mode=new"
-```
-
-3. 从启动输出取得 `Local URL` 和 `Connect token`，在 Codex 右侧浏览器打开：
+2. 用户已经启动本机 Sneeai Agent 后，打开：
 
 ```text
-<Vite Local 地址>/canvas?mode=new#agentUrl=<Local URL>&agentToken=<Connect token>
+<Vite Local 地址>/canvas?mode=new
 ```
 
-## MCP 与连接地址
+## MCP 与连接边界
 
-插件在新的 Codex 任务中加载时会自动启动 `npx -y @sneeai/sneeai-agent@0.3.2 mcp`。MCP 启动前会自动拉起或复用同一个普通本地 Sneeai Agent，再通过本地配置把画布工具请求转发给它；多个 MCP 进程不会重复占用 Agent 端口。
+插件只启动 Sneeai Codex Bridge。Bridge 将 MCP 工具请求转发到已经安装并运行的本机 Sneeai Agent；它不会下载、启动、升级 Agent，也不处理网站授权凭据。
 
 ## 打开模式
 

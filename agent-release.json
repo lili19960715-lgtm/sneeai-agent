@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "latest_version": "0.3.3",
+  "minimum_supported_version": "0.3.3",
+  "protocol_version": 1,
+  "download_page_url": "https://sneeai.com/agent",
+  "install_command": "npx -y @sneeai/sneeai-agent@0.3.3",
+  "release_notes_url": "https://github.com/sneeai/sneeai-agent/releases"
+}

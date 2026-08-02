@@ -3,6 +3,9 @@ import type { CodexPlanUpdate } from "./codex-protocol.js";
 
 type AgentHistoryMessage = { id: string; role: "user" | "assistant" | "tool" | "error"; title?: string; text: string; detail?: unknown; streamId?: string };
 
+const MODEL_BACKEND_PENDING = "宿主平台后台接入尚未完成，当前无法使用模型能力。";
+const LEGACY_USER_CONFIG_ERROR = /(?:请先配置(?:\s*(?:Base URL|API ?Key)|[^。\n]*模型)|AI 配置未就绪|请先在设置里配置模型与密钥)/i;
+
 /** 将 Codex 线程转换为列表展示所需的摘要。 */
 export function summarizeCodexThread(thread: unknown) {
     return {
@@ -46,7 +49,7 @@ export function threadMessages(thread: unknown, planUpdates: CodexPlanUpdate[] =
             }
             if (type === "mcpToolCall") {
                 const tool = String(field(item, "tool") || "工具调用");
-                const error = String(field(field(item, "error"), "message") || "");
+                const error = toolFailureText(item);
                 const input = toolArguments(field(item, "arguments"));
                 messages.push({ id, role: "tool", title: toolName(tool), text: error || toolHistorySummary(tool, item, input), detail: toolHistoryDetail(tool, item, input, error) });
             }
@@ -73,7 +76,7 @@ export function threadMessages(thread: unknown, planUpdates: CodexPlanUpdate[] =
             if (type === "dynamicToolCall") {
                 const tool = String(field(item, "tool") || "");
                 const title = toolName(tool);
-                const error = String(field(field(item, "error"), "message") || "");
+                const error = toolFailureText(item);
                 const status = String(field(item, "status") || "");
                 const failed = Boolean(error) || field(item, "success") === false || status === "failed" || status === "error";
                 messages.push({ id, role: "tool", title, text: error || readableText(field(item, "contentItems")) || `${title}${failed ? "失败" : "完成"}`, detail: { kind: "tool", status: failed ? "failed" : status } });
@@ -116,8 +119,26 @@ function planStatus(tasks: Array<{ status: string }>, turnStatus?: string) {
 
 /** 将常见 Codex 错误转换为普通用户可理解的提示。 */
 function userFacingCodexError(message: string) {
-    if (/selected model is at capacity/i.test(message)) return { title: "模型暂时繁忙", text: "当前选择的模型请求量过大，暂时无法处理。请稍后重试，或切换其他模型后再试。" };
-    return { title: "任务失败", text: message || "Codex 未能完成本次任务，请稍后重试。" };
+    const text = userFacingErrorText(message);
+    if (text === MODEL_BACKEND_PENDING) return { title: "模型能力暂不可用", text };
+    if (/selected model is at capacity/i.test(text)) return { title: "模型暂时繁忙", text: "当前选择的模型请求量过大，暂时无法处理。请稍后重试，或切换其他模型后再试。" };
+    return { title: "任务失败", text: text || "Codex 未能完成本次任务，请稍后重试。" };
+}
+
+function userFacingErrorText(message: string) {
+    const text = message.trim();
+    return LEGACY_USER_CONFIG_ERROR.test(text) ? MODEL_BACKEND_PENDING : text;
+}
+
+/** 从显式错误或失败工具结果中提取可展示的错误文本。 */
+function toolFailureText(item: unknown) {
+    const explicit = userFacingErrorText(String(field(field(item, "error"), "message") || ""));
+    if (explicit) return explicit;
+    const status = String(field(item, "status") || "");
+    const result = field(item, "result");
+    const failed = field(item, "success") === false || status === "failed" || status === "error" || field(result, "isError") === true;
+    if (!failed) return "";
+    return userFacingErrorText(readableText(field(result, "content")) || readableText(field(item, "contentItems")));
 }
 
 /** 提取用户输入条目中的文本与附件占位信息。 */
@@ -297,7 +318,6 @@ function routeName(path: string) {
     if (path.startsWith("/video")) return "视频工作台";
     if (path.startsWith("/prompts")) return "提示词中心";
     if (path.startsWith("/assets")) return "我的素材";
-    if (path.startsWith("/config")) return "配置页面";
     return path;
 }
 
