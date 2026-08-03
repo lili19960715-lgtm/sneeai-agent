@@ -120,6 +120,8 @@ test("website entitlement remains fail-closed across the local HTTP Agent lifecy
         });
         const proofBody = await jsonBody(proofResponse);
         assert.equal(proofResponse.status, 200, JSON.stringify(proofBody));
+        assert.equal(proofBody.service, "sneeai-agent");
+        assert.equal(proofBody.deviceId, deviceId);
         assert.equal(proofBody.instanceKey, instanceKey);
         assert.equal(proofBody.instancePublicKey, instancePublicKey);
         assert.equal(verifyPairingProof(challenge, String(proofBody.proof || ""), instancePublicKey), true);
@@ -145,6 +147,33 @@ test("website entitlement remains fail-closed across the local HTTP Agent lifecy
         assert.equal(replacementPair.status, 403);
         assert.equal((await jsonBody(replacementPair)).code, "agent_entitlement_binding_mismatch");
         assert.equal(fakeCodex.verifiedProfiles.length, 0);
+    });
+
+    await t.test("an optional development entitlement is verified and receives a pairing confirmation", async () => {
+        const origin = "http://localhost:3000";
+        const profileId = "v1:user:development-user";
+        const clientId = "development-client";
+        const pairingNonce = crypto.randomBytes(32).toString("base64url");
+        const entitlement = authority.signEntitlement(ticketInput("development-user", clientId, deviceId, agentVersion), origin);
+        const restoreOptionalEntitlement = replaceEnvironment({
+            CANVAS_AGENT_REQUIRE_ENTITLEMENT: undefined,
+            CANVAS_AGENT_ENTITLEMENT_PUBLIC_KEY: authority.encodedPublicKey,
+            CANVAS_AGENT_ENTITLEMENT_ISSUER: origin,
+        });
+        try {
+            const response = await pair(agentUrl, origin, { profileId, clientId, entitlement, pairingNonce });
+            const connection = await jsonBody(response);
+            const pairingTicket = String(connection.pairingTicket || "");
+            assert.equal(response.status, 200, JSON.stringify(connection));
+            assert.equal(Number.isSafeInteger(connection.pairingTicketExpiresAt), true);
+            assert.equal(
+                verifyPairingConfirmation(pairingNonce, entitlement, pairingTicket, String(connection.pairingConfirmation || ""), instancePublicKey),
+                true,
+            );
+        } finally {
+            restoreOptionalEntitlement();
+            fakeCodex.verifiedProfiles.length = 0;
+        }
     });
 
     await t.test("unauthorized pair and Codex routes reject every long-lived or missing credential", async () => {
@@ -226,7 +255,8 @@ test("website entitlement remains fail-closed across the local HTTP Agent lifecy
         assert.equal(connection.instanceKey, instanceKey);
         assert.equal(connection.instancePublicKey, instancePublicKey);
         assert.equal(verifyPairingConfirmation(pairingNonce, entitlement, firstTicket, pairingConfirmation, instancePublicKey), true);
-        assert.equal(verifyPairingConfirmation(`${pairingNonce.slice(0, -1)}A`, entitlement, firstTicket, pairingConfirmation, instancePublicKey), false);
+        const forgedNonce = `${pairingNonce.slice(0, -1)}${pairingNonce.endsWith("A") ? "B" : "A"}`;
+        assert.equal(verifyPairingConfirmation(forgedNonce, entitlement, firstTicket, pairingConfirmation, instancePublicKey), false);
         assert.equal(verifyPairingConfirmation(pairingNonce, entitlement, `${firstTicket}-forged`, pairingConfirmation, instancePublicKey), false);
 
         const workspace = await protectedWorkspace(agentUrl, authority.origin, firstTicket, "v1:user:renew-user", "renew-client");
@@ -583,6 +613,35 @@ class FakeEntitlementAuthority {
         return authority;
     }
 
+    get encodedPublicKey() {
+        return this.publicKey;
+    }
+
+    signEntitlement(input: TicketInput, origin = this.origin) {
+        const issuedAt = Math.floor(this.now() / 1000);
+        const expiresAt = issuedAt + (input.lifetimeSeconds || 120);
+        const header = encode({ alg: "EdDSA", typ: "JWT", kid: this.keyId });
+        const claims = encode({
+            version: 1,
+            iss: origin,
+            aud: "sneeai-agent",
+            sub: input.subject || input.userId,
+            scope: "agent:connect",
+            origin,
+            profile_id: input.profileId,
+            client_id: input.clientId,
+            device_id: input.deviceId,
+            instance_key: input.instanceKey || this.instanceKey,
+            authorization_version: input.authorizationVersion || 1,
+            minimum_agent_version: input.minimumAgentVersion || input.agentVersion,
+            iat: issuedAt,
+            exp: expiresAt,
+            jti: crypto.randomBytes(16).toString("base64url"),
+        });
+        const unsigned = `${header}.${claims}`;
+        return `${unsigned}.${crypto.sign(null, Buffer.from(unsigned), this.privateKey).toString("base64url")}`;
+    }
+
     async issue(input: TicketInput) {
         const response = await this.requestTicket(input);
         const body = await jsonBody(response);
@@ -681,29 +740,9 @@ class FakeEntitlementAuthority {
                 res.statusCode = 403;
                 return void res.end(JSON.stringify({ code: "agent_entitlement_revoked" }));
             }
-            const issuedAt = Math.floor(this.now() / 1000);
-            const expiresAt = issuedAt + (input.lifetimeSeconds || 120);
-            const header = encode({ alg: "EdDSA", typ: "JWT", kid: this.keyId });
-            const claims = encode({
-                version: 1,
-                iss: this.origin,
-                aud: "sneeai-agent",
-                sub: input.subject || input.userId,
-                scope: "agent:connect",
-                origin: this.origin,
-                profile_id: input.profileId,
-                client_id: input.clientId,
-                device_id: input.deviceId,
-                instance_key: input.instanceKey || this.instanceKey,
-                authorization_version: input.authorizationVersion || 1,
-                minimum_agent_version: input.minimumAgentVersion || input.agentVersion,
-                iat: issuedAt,
-                exp: expiresAt,
-                jti: crypto.randomBytes(16).toString("base64url"),
-            });
-            const unsigned = `${header}.${claims}`;
-            const signature = crypto.sign(null, Buffer.from(unsigned), this.privateKey).toString("base64url");
-            return void res.end(JSON.stringify({ token: `${unsigned}.${signature}`, expiresAt: expiresAt * 1000 }));
+            const token = this.signEntitlement(input);
+            const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")) as { exp: number };
+            return void res.end(JSON.stringify({ token, expiresAt: claims.exp * 1000 }));
         }
         res.statusCode = 404;
         res.end(JSON.stringify({ error: "not found" }));

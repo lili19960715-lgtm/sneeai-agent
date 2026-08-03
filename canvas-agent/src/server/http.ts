@@ -264,7 +264,7 @@ export function startHttpServer(options: HttpServerOptions = {}) {
             agentVersion: VERSION,
         }, { now: now() });
         res.setHeader("Cache-Control", "no-store");
-        res.json({ ok: true, proof, instanceKey: pairingIdentity.instanceKey, instancePublicKey: pairingIdentity.instancePublicKey, ...protocolMetadata(VERSION), negotiatedCapabilities: negotiation.capabilities });
+        res.json({ ok: true, service: AGENT_SERVICE, proof, deviceId: canvasAgentDeviceId(config), instanceKey: pairingIdentity.instanceKey, instancePublicKey: pairingIdentity.instancePublicKey, ...protocolMetadata(VERSION), negotiatedCapabilities: negotiation.capabilities });
     }));
     app.post("/pair", express.json({ limit: "16kb" }), route(async (req, res) => {
         const origin = req.headers.origin || "";
@@ -277,11 +277,13 @@ export function startHttpServer(options: HttpServerOptions = {}) {
         const entitlementToken = String(req.headers["x-canvas-agent-entitlement"] || "");
         let entitlement = "";
         let authorization: AgentTicketAuthorization | undefined;
-        if (entitlementRequired(origin)) {
-            if (!entitlementToken) throw new EntitlementVerificationError("agent_entitlement_required", "Agent entitlement is required");
+        const requiresEntitlement = entitlementRequired(origin);
+        if (entitlementToken) {
             entitlement = entitlementToken;
             const claims = await verifyPlatformEntitlement(entitlementToken, { origin, profileId: profile.id, clientId, deviceId, instanceKey: pairingIdentity.instanceKey, agentVersion: VERSION }, { now: now() });
             authorization = leases.renew(profile.key, claims);
+        } else if (requiresEntitlement) {
+            throw new EntitlementVerificationError("agent_entitlement_required", "Agent entitlement is required");
         }
         let previousMode: "inherit" | "isolated" | null = null;
         let modeChanged = false;
@@ -306,17 +308,20 @@ export function startHttpServer(options: HttpServerOptions = {}) {
             config.origins.push(origin);
             saveConfig(config);
         }
+        const pairingIssuedAt = now();
+        const pairingTtlMs = Math.min(PAIRING_TICKET_TTL_MS, authorization ? Math.max(1, authorization.expiresAt - pairingIssuedAt) : PAIRING_TICKET_TTL_MS);
+        const pairingTicketExpiresAt = pairingIssuedAt + pairingTtlMs;
         const pairingTicket = createAgentTicket(config.token, {
             kind: "pairing",
             origin,
             profileKey: profile.key,
             clientId,
-            now: now(),
-            ttlMs: Math.min(PAIRING_TICKET_TTL_MS, authorization ? Math.max(1, authorization.expiresAt - now()) : PAIRING_TICKET_TTL_MS),
+            now: pairingIssuedAt,
+            ttlMs: pairingTtlMs,
             authorization,
         });
         res.setHeader("Cache-Control", "no-store");
-        res.json({ ok: true, url: config.url, token: pairingTicket, pairingTicket, profileKey: profile.key, deviceId, instanceKey: pairingIdentity.instanceKey, instancePublicKey: pairingIdentity.instancePublicKey, service: AGENT_SERVICE, version: VERSION, ...protocolMetadata(VERSION), negotiatedCapabilities: negotiation.capabilities, ...(authorization ? { pairingConfirmation: pairingIdentity.confirm(String(req.body?.pairingNonce || ""), entitlement, pairingTicket) } : {}), ...publicCodexConnection(config) });
+        res.json({ ok: true, url: config.url, token: pairingTicket, pairingTicket, pairingTicketExpiresAt, profileKey: profile.key, deviceId, instanceKey: pairingIdentity.instanceKey, instancePublicKey: pairingIdentity.instancePublicKey, service: AGENT_SERVICE, version: VERSION, ...protocolMetadata(VERSION), negotiatedCapabilities: negotiation.capabilities, ...(authorization ? { pairingConfirmation: pairingIdentity.confirm(String(req.body?.pairingNonce || ""), entitlement, pairingTicket) } : {}), ...publicCodexConnection(config) });
     }));
     app.use(authenticateRequest);
     app.use(express.json({ limit: "30mb" }));

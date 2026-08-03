@@ -91,7 +91,7 @@ test("the plugin MCP process starts a protocol-clean HTTP bridge", async (t) => 
         headers: { origin: DEV_ORIGIN, "content-type": "application/json" },
         body: modernPairBody(),
     });
-    const connection = await paired.json() as { ok?: boolean; url?: string; token?: string; deviceId?: string; protocolVersion?: number; capabilities?: string[]; buildVersion?: string; pairingTicket?: string };
+    const connection = await paired.json() as { ok?: boolean; url?: string; token?: string; deviceId?: string; protocolVersion?: number; capabilities?: string[]; buildVersion?: string; pairingTicket?: string; pairingTicketExpiresAt?: number };
     assert.equal(paired.status, 200);
     assert.equal(connection.ok, true);
     assert.equal(connection.url, fixture.url);
@@ -101,6 +101,8 @@ test("the plugin MCP process starts a protocol-clean HTTP bridge", async (t) => 
     assert.equal(connection.buildVersion, VERSION);
     assert.ok(connection.capabilities?.includes("pairing.ticket.v1"));
     assert.match(connection.pairingTicket || "", /^cat1\./);
+    assert.equal(Number.isSafeInteger(connection.pairingTicketExpiresAt), true);
+    assert.ok(connection.pairingTicketExpiresAt! > Date.now());
 
     const workspace = await fetch(`${fixture.url}/agent/codex/workspace`, {
         headers: { origin: DEV_ORIGIN, "x-canvas-agent-token": connection.token! },
