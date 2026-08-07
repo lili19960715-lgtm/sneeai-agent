@@ -23,6 +23,24 @@ const STREAM_UPDATE_INTERVAL_MS = 40;
 const STOP_TIMEOUT_MS = 1_500;
 const KILL_TIMEOUT_MS = 1_000;
 const MCP_STARTUP_TIMEOUT_SEC = 60;
+/** 单个 turn 的总运行时限；超时后主动中断并拒绝等待方。 */
+export const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** 环境变量可覆盖 turn 总超时（毫秒）。 */
+function defaultTurnTimeoutMs() {
+    const value = Number(process.env.CANVAS_AGENT_TURN_TIMEOUT_MS || "");
+    return Number.isFinite(value) && value > 0 ? value : DEFAULT_TURN_TIMEOUT_MS;
+}
+
+/** 明确指示 Codex turn 运行超过总时限、已由 Agent 中断的错误。 */
+export class TurnTimeoutError extends Error {
+    readonly code = "codex_turn_timeout";
+
+    constructor(readonly turnId: string, readonly timeoutMs: number) {
+        super(`Codex turn 运行超过 ${Math.round(timeoutMs / 1000)} 秒，已自动中断`);
+        this.name = "TurnTimeoutError";
+    }
+}
 
 /** 封装 Codex app-server 的 JSON-RPC 通信与事件转换。 */
 export class CodexAppClient {
@@ -34,6 +52,7 @@ export class CodexAppClient {
     private lastUsage: unknown = null;
     private pending = new Map<number, PendingRequest>();
     private activeTurns = new Map<string, PendingRequest>();
+    private activeTurnTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private completedTurns = new Map<string, Error | null>();
     private pendingDeltas = new Map<string, PendingDelta>();
     private plansByTurn = new Map<string, CodexPlanUpdate>();
@@ -146,8 +165,8 @@ export class CodexAppClient {
         });
     }
 
-    /** 启动一个 Codex turn 并等待完成通知。 */
-    async startTurn(threadId: string, prompt: string, images: string[], permissionMode: AgentPermissionMode, onTurn?: (turnId: string) => void) {
+    /** 启动一个 Codex turn 并等待完成通知；超过 turnTimeoutMs 后中断并抛 TurnTimeoutError。 */
+    async startTurn(threadId: string, prompt: string, images: string[], permissionMode: AgentPermissionMode, onTurn?: (turnId: string) => void, turnTimeoutMs = defaultTurnTimeoutMs()) {
         this.currentThreadId = threadId;
         const { turn } = await this.request("turn/start", { threadId, input: codexInput(prompt, images), ...turnSettings(permissionMode) });
         const turnId = turn.id;
@@ -162,7 +181,12 @@ export class CodexAppClient {
             if (completed) throw completed;
             return;
         }
-        await new Promise((resolve, reject) => this.activeTurns.set(turnId, { resolve, reject }));
+        await new Promise<unknown>((resolve, reject) => {
+            this.activeTurns.set(turnId, { resolve, reject });
+            const timer = setTimeout(() => this.expireTurn(threadId, turnId, turnTimeoutMs), turnTimeoutMs);
+            timer.unref?.();
+            this.activeTurnTimers.set(turnId, timer);
+        });
     }
 
     /** 中断当前正在运行的 Codex turn。 */
@@ -177,6 +201,38 @@ export class CodexAppClient {
         } catch (error) {
             logger.warn("Failed to interrupt Codex turn", { error, threadId, turnId });
             return false;
+        }
+    }
+
+    /** turn 总超时处理：请求中断、清理 pending 与当前线程状态，并以明确错误结束等待。 */
+    private expireTurn(threadId: string, turnId: string, timeoutMs: number) {
+        const pending = this.activeTurns.get(turnId);
+        if (!pending) return; // 已在超时前正常完成
+        this.activeTurns.delete(turnId);
+        this.clearTurnTimer(turnId);
+        logger.error("Codex turn exceeded total timeout, interrupting", { threadId, turnId, timeoutMs });
+        void this.interruptTurn(threadId, turnId).catch(() => undefined);
+        if (turnId === this.currentTurnId) {
+            this.currentThreadId = "";
+            this.currentTurnId = "";
+        }
+        pending.reject(new TurnTimeoutError(turnId, timeoutMs));
+    }
+
+    /** 中断指定 turn，不依赖 currentThreadId/currentTurnId，供超时清理使用。 */
+    private async interruptTurn(threadId: string, turnId: string) {
+        try {
+            await this.request("turn/interrupt", { threadId, turnId });
+        } catch (error) {
+            logger.warn("Failed to interrupt timed-out Codex turn", { error, threadId, turnId });
+        }
+    }
+
+    private clearTurnTimer(turnId: string) {
+        const timer = this.activeTurnTimers.get(turnId);
+        if (timer) {
+            clearTimeout(timer);
+            this.activeTurnTimers.delete(turnId);
         }
     }
 
@@ -296,6 +352,7 @@ export class CodexAppClient {
             const error = turn.error;
             if (pending) {
                 this.activeTurns.delete(turnId);
+                this.clearTurnTimer(turnId);
                 error ? pending.reject(new Error(error.message || "Codex turn failed")) : pending.resolve(event);
             } else if (turnId) {
                 this.completedTurns.set(turnId, error ? new Error(error.message || "Codex turn failed") : null);
@@ -366,8 +423,10 @@ export class CodexAppClient {
     private failAll(message: string) {
         [...this.pending.values(), ...this.activeTurns.values()].forEach((item) => item.reject(new Error(message)));
         this.pendingDeltas.forEach((item) => clearTimeout(item.timer));
+        this.activeTurnTimers.forEach((timer) => clearTimeout(timer));
         this.pending.clear();
         this.activeTurns.clear();
+        this.activeTurnTimers.clear();
         this.pendingDeltas.clear();
         this.textByItem.clear();
         this.approvalRequests.clear();

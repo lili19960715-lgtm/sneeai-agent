@@ -178,7 +178,8 @@ test("pairing confirmation binds the browser nonce and both tickets to one Agent
     });
 
     assert.equal(crypto.verify(null, pairingConfirmationMessage(nonce, entitlement, pairingTicket), publicKey, Buffer.from(confirmation, "base64url")), true);
-    assert.equal(crypto.verify(null, pairingConfirmationMessage(`${nonce.slice(0, -1)}A`, entitlement, pairingTicket), publicKey, Buffer.from(confirmation, "base64url")), false);
+    const forgedNonce = `${nonce.slice(0, -1)}${nonce.endsWith("A") ? "B" : "A"}`;
+    assert.equal(crypto.verify(null, pairingConfirmationMessage(forgedNonce, entitlement, pairingTicket), publicKey, Buffer.from(confirmation, "base64url")), false);
     assert.equal(crypto.verify(null, pairingConfirmationMessage(nonce, entitlement, `${pairingTicket}-forged`), publicKey, Buffer.from(confirmation, "base64url")), false);
     assert.equal(
         crypto.verify(null, pairingConfirmationMessage(nonce, entitlement, pairingTicket), publicKey, Buffer.from(replacement.confirm(nonce, entitlement, pairingTicket), "base64url")),

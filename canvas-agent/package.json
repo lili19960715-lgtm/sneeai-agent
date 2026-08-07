@@ -3,6 +3,7 @@
   "version": "0.3.3",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@10.12.0",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
@@ -16,7 +17,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "debug": "tsx src/index.ts --debug",
-    "test": "tsx --test --test-concurrency=1 src/agent/codex-client.test.ts src/agent/codex-history.test.ts src/agent/codex-provider-policy.test.ts src/agent/codex-runtime.test.ts src/canvas/session.test.ts src/canvas/session-registry.test.ts src/config.test.ts src/entitlement.test.ts src/entitlement-lease.test.ts src/pairing.test.ts src/pairing-ticket.test.ts src/profile.test.ts src/protocol.test.ts src/tool-authorization.test.ts src/server/cors.test.ts src/server/entitlement-http.test.ts src/server/local-file-capabilities.test.ts src/server/runtime.test.ts",
+    "test": "tsx --test --test-concurrency=1 src/agent/claude.test.ts src/agent/codex-client.test.ts src/agent/codex-history.test.ts src/agent/codex-provider-policy.test.ts src/agent/codex-runtime.test.ts src/canvas/session.test.ts src/canvas/session-registry.test.ts src/config.test.ts src/entitlement.test.ts src/entitlement-lease.test.ts src/pairing.test.ts src/pairing-ticket.test.ts src/profile.test.ts src/protocol.test.ts src/tool-authorization.test.ts src/server/cors.test.ts src/server/entitlement-http.test.ts src/server/local-file-capabilities.test.ts src/server/runtime.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",

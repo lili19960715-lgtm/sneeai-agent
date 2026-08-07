@@ -10,6 +10,8 @@ const OFFICIAL_CANVAS_ORIGINS = new Set(["https://sneeai.com"]);
 const LOCAL_DEVELOPMENT_ORIGINS = new Set([
     "http://127.0.0.1:3000",
     "http://localhost:3000",
+    "http://127.0.0.1:3001",
+    "http://localhost:3001",
     "http://127.0.0.1:3100",
     "http://localhost:3100",
 ]);

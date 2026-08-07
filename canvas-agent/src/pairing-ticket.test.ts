@@ -18,6 +18,12 @@ test("pairing tickets are bound to origin, profile, client, and expiry", () => {
     assert.deepEqual(verifyAgentTicket(secret, ticket, { kind: "pairing", ...binding }, 1_501), { ok: false, reason: "expired" });
 });
 
+test("tickets with an empty client id never satisfy a client-bound request", () => {
+    const ticket = createAgentTicket(secret, { kind: "pairing", origin: binding.origin, profileKey: binding.profileKey, now: 1_000, ttlMs: 500 });
+
+    assert.deepEqual(verifyAgentTicket(secret, ticket, { kind: "pairing", origin: binding.origin, profileKey: binding.profileKey, clientId: binding.clientId }, 1_250), { ok: false, reason: "client" });
+});
+
 test("tampered or wrongly signed tickets are rejected", () => {
     const ticket = createAgentTicket(secret, { kind: "pairing", ...binding, now: 1_000, ttlMs: 500 });
     const tampered = `${ticket.slice(0, -1)}${ticket.endsWith("0") ? "1" : "0"}`;

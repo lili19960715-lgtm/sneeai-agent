@@ -11,7 +11,7 @@ export class CanvasSessionRegistry {
     session(profileKey: string) {
         let session = this.sessions.get(profileKey);
         if (!session) {
-            session = new CanvasSession({ replayGuard: this.replayGuard, now: this.options.now });
+            session = new CanvasSession({ profileKey, replayGuard: this.replayGuard, now: this.options.now });
             this.sessions.set(profileKey, session);
         }
         return session;

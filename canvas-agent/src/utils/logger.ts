@@ -7,6 +7,12 @@ import winston, {format, transports, type Logger as WinstonLogger} from "winston
 import {CONFIG_DIR} from "../config.js";
 import {formatDateForFilename} from "./date.js";
 
+/** 单个日志文件上限 10MB，最多保留 5 个轮转文件。 */
+const FILE_MAXSIZE_BYTES = 10 * 1024 * 1024;
+const FILE_MAX_FILES = 5;
+/** 单条日志文本最长保留长度，超长截断。 */
+const MAX_LOG_TEXT_LENGTH = 4_000;
+
 /** 管理 Sneeai Agent 的终端与文件 Debug 日志。 */
 export class Logger {
     readonly enabled = process.argv.includes("--debug");
@@ -29,33 +35,43 @@ export class Logger {
                     format: format.combine(format.timestamp({format: "HH:mm:ss"}), line),
                     ...(mcpMode ? {stderrLevels: ["debug", "info", "warn", "error"]} : {}),
                 }),
-                new transports.File({filename: this.filePath, options: {mode: 0o600}, format: format.combine(format.timestamp({format: "HH:mm:ss"}), line)}),
+                new transports.File({
+                    filename: this.filePath,
+                    maxsize: FILE_MAXSIZE_BYTES,
+                    maxFiles: FILE_MAX_FILES,
+                    options: {mode: 0o600},
+                    format: format.combine(format.timestamp({format: "HH:mm:ss"}), line),
+                }),
             ],
         });
     }
 
     /** 输出 Debug 级别日志。 */
     debug(message: string, details?: unknown) {
-        if (details === undefined) this.logger?.debug(message);
-        else this.logger?.debug(message, {details: sanitize(details)});
+        const safeMessage = sanitizeMessage(message);
+        if (details === undefined) this.logger?.debug(safeMessage);
+        else this.logger?.debug(safeMessage, {details: sanitize(details)});
     }
 
     /** 输出 Info 级别日志。 */
     info(message: string, details?: unknown) {
-        if (details === undefined) this.logger?.info(message);
-        else this.logger?.info(message, {details: sanitize(details)});
+        const safeMessage = sanitizeMessage(message);
+        if (details === undefined) this.logger?.info(safeMessage);
+        else this.logger?.info(safeMessage, {details: sanitize(details)});
     }
 
     /** 输出 Warn 级别日志。 */
     warn(message: string, details?: unknown) {
-        if (details === undefined) this.logger?.warn(message);
-        else this.logger?.warn(message, {details: sanitize(details)});
+        const safeMessage = sanitizeMessage(message);
+        if (details === undefined) this.logger?.warn(safeMessage);
+        else this.logger?.warn(safeMessage, {details: sanitize(details)});
     }
 
     /** 输出 Error 级别日志。 */
     error(message: string, details?: unknown) {
-        if (details === undefined) this.logger?.error(message);
-        else this.logger?.error(message, {details: sanitize(details)});
+        const safeMessage = sanitizeMessage(message);
+        if (details === undefined) this.logger?.error(safeMessage);
+        else this.logger?.error(safeMessage, {details: sanitize(details)});
     }
 }
 
@@ -67,14 +83,25 @@ function formatDetails(details: unknown) {
     return text ? ` ${text}` : "";
 }
 
+/** 单条日志 message 的脱敏 + 截断。 */
+function sanitizeMessage(message: string) {
+    return truncateText(redactSensitiveText(message));
+}
+
+/** 超长文本截断，保留长度信息。 */
+function truncateText(value: string) {
+    if (value.length <= MAX_LOG_TEXT_LENGTH) return value;
+    return `${value.slice(0, MAX_LOG_TEXT_LENGTH)}…[truncated ${value.length - MAX_LOG_TEXT_LENGTH} chars]`;
+}
+
 /** 清理日志内容中的敏感数据和不可序列化引用。 */
 function sanitize(value: unknown, key = "", seen = new WeakSet<object>()): unknown {
     if (/token|authorization|api.?key|dataurl/i.test(key)) return "[REDACTED]";
     if (typeof value === "string") {
         if (value.startsWith("data:")) return `[DATA URL ${value.length} chars]`;
-        return redactSensitiveText(value);
+        return truncateText(redactSensitiveText(value));
     }
-    if (value instanceof Error) return {name: value.name, message: redactSensitiveText(value.message), stack: value.stack ? redactSensitiveText(value.stack) : undefined};
+    if (value instanceof Error) return {name: value.name, message: truncateText(redactSensitiveText(value.message)), stack: value.stack ? truncateText(redactSensitiveText(value.stack)) : undefined};
     if (!value || typeof value !== "object") return value;
     if (seen.has(value)) return "[CIRCULAR]";
     seen.add(value);

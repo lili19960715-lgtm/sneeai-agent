@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
 import type { Server } from "node:http";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
@@ -10,7 +9,7 @@ import { archiveCodexThread, interruptCodexTurn, isRecoverableThreadError, listC
 import { CodexProviderPolicyError } from "../agent/codex-provider-policy.js";
 import { canvasCodexConnectionStatus, canvasCodexMode, CodexConnectionInputError, CodexRelayApiKeyRequiredError, configureCanvasCodexConnection, codexRuntimeFingerprint } from "../agent/codex-runtime.js";
 import type { AgentAttachment, AgentEmit, AgentPermissionMode } from "../agent/types.js";
-import { CanvasSession, CanvasToolDecisionError, type CanvasClientAuthorization, type PendingToolProposal } from "../canvas/session.js";
+import { CanvasCodexControlError, CanvasSession, CanvasToolDecisionError, type CanvasClientAuthorization, type PendingToolProposal } from "../canvas/session.js";
 import { CanvasSessionRegistry } from "../canvas/session-registry.js";
 import { AGENT_SERVICE, canvasAgentDeviceId, DEFAULT_PORT, ensureProfileWorkspace, ensureSiteWorkspace, loadConfig, saveConfig, updateProfileWorkspace, updateSiteWorkspace, VERSION, type CanvasAgentConfig } from "../config.js";
 import { EntitlementLeaseRegistry } from "../entitlement-lease.js";
@@ -23,6 +22,7 @@ import { negotiateProtocol, protocolHeaders, protocolMetadata, REQUIRED_PAIRING_
 import { ToolAuthorizationVerificationError, verifyToolAuthorization } from "../tool-authorization.js";
 import { logger } from "../utils/logger.js";
 import { authorizeAutomaticPairing, authorizeRequestOrigin } from "./cors.js";
+import { LocalFileCapabilityError, LocalFileCapabilityRegistry } from "./local-file-capabilities.js";
 import { compareRuntimeClaims, createRuntimeClaim, isRuntimeClaim } from "./runtime-claim.js";
 
 type CodexTurnOptions = {
@@ -42,6 +42,8 @@ type HttpCodexDependencies = {
     stopProfile: (profileId: string) => Promise<boolean>;
     startThread: (emit: AgentEmit, cwd?: string, permissionMode?: AgentPermissionMode, profileId?: string) => Promise<unknown>;
     runTurn: (prompt: string, emit: AgentEmit, attachments?: AgentAttachment[], options?: CodexTurnOptions) => Promise<void>;
+    resolveApproval: (requestId: string, decision: string) => Promise<boolean>;
+    interruptTurn: (threadId?: string, profileId?: string) => Promise<boolean>;
 };
 
 export type HttpServerOptions = {
@@ -65,6 +67,16 @@ type RequestAuthorization = {
 
 type RequestWithAuthorization = Request & { canvasAuthorization?: RequestAuthorization };
 
+class FullPermissionModeError extends Error {
+    readonly statusCode = 403;
+    readonly code = "full_permission_disabled";
+
+    constructor() {
+        super("网页不能启用 Codex 完全访问权限");
+        this.name = "FullPermissionModeError";
+    }
+}
+
 /** 启动仅监听本机的 Sneeai Agent HTTP 服务。 */
 export function startHttpServer(options: HttpServerOptions = {}) {
     const config = loadConfig(true);
@@ -79,6 +91,8 @@ export function startHttpServer(options: HttpServerOptions = {}) {
         stopProfile: stopCodexProfile,
         startThread: startCodexThread,
         runTurn: runCodexTurn,
+        resolveApproval: resolveCodexApproval,
+        interruptTurn: interruptCodexTurn,
         ...options.codex,
     };
 
@@ -86,8 +100,10 @@ export function startHttpServer(options: HttpServerOptions = {}) {
     const pairingIdentity = createAgentPairingIdentity(config.token);
     const eventTicketReplay = new EventTicketReplayGuard();
     const knownProfiles = new Map<string, AgentProfile>();
+    const localFiles = new LocalFileCapabilityRegistry({ now });
     const leases = new EntitlementLeaseRegistry((profileKey, reason) => {
         sessions.disposeProfile(profileKey, `网站 Agent 授权${reason === "expired" ? "已过期" : "已失效"}`);
+        localFiles.revokeProfile(profileKey);
         void codex.stopProfile(profileKey);
     }, now);
     let server: Server;
@@ -103,8 +119,10 @@ export function startHttpServer(options: HttpServerOptions = {}) {
     const emitFor = (profile: AgentProfile) => (type: string, payload: unknown) => {
         const session = sessionFor(profile);
         const data = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
-        const threadId = String(data.threadId || data.thread_id || workspaceFor(profile).activeThreadId || "");
-        threadId ? session.emitThread(type, threadId, data) : session.emitAll(type, data);
+        const workspace = workspaceFor(profile);
+        const protectedData = localFiles.protectPayload(profile.key, workspace.workspacePath, data) as Record<string, unknown>;
+        const threadId = String(protectedData.threadId || protectedData.thread_id || workspace.activeThreadId || "");
+        threadId ? session.emitThread(type, threadId, protectedData) : session.emitAll(type, protectedData);
     };
     /** 将 provider 预检纳入运行时忙碌状态，避免配置交接中断检查。 */
     const verifyCodexAccess = async (profile: AgentProfile) => {
@@ -389,19 +407,19 @@ export function startHttpServer(options: HttpServerOptions = {}) {
         res.type(attachment.type).send(Buffer.from(data, "base64"));
     }));
     app.post("/agent/local-file/reveal", route(async (req, res) => {
-        const filePath = String(req.body?.path || "");
-        if (!path.isAbsolute(filePath)) return res.status(400).json({ ok: false, error: "文件路径必须是绝对路径" });
-        const file = await stat(filePath);
-        await revealLocalFile(filePath, file.isDirectory());
+        const authorization = requestAuthorization(req);
+        const entry = localFiles.resolve(authorization.profile.key, String(req.body?.handle || ""));
+        await revealLocalFile(entry.filePath, entry.isDirectory);
         res.json({ ok: true });
     }));
     app.post("/agent/local-image", route(async (req, res) => {
-        const filePath = String(req.body?.path || "");
-        if (!path.isAbsolute(filePath) || !/\.(?:avif|gif|jpe?g|png|webp)$/i.test(filePath)) return res.status(400).json({ ok: false, error: "图片路径无效" });
-        const file = await stat(filePath);
-        if (!file.isFile()) return res.status(400).json({ ok: false, error: "图片文件无效" });
+        const authorization = requestAuthorization(req);
+        const reference = String(req.body?.handle || "");
+        const entry = localFiles.resolve(authorization.profile.key, reference);
+        if (entry.isDirectory || !/\.(?:avif|gif|jpe?g|png|webp)$/i.test(entry.filePath)) return res.status(400).json({ ok: false, error: "图片文件无效" });
+        const image = await localFiles.readFile(authorization.profile.key, reference, 25 * 1024 * 1024);
         res.setHeader("Cache-Control", "no-store");
-        res.type(path.extname(filePath)).send(await readFile(filePath));
+        res.type(path.extname(entry.filePath)).send(image.data);
     }));
     app.post("/api/tools", route(async (req, res) => {
         const authorization = requestAuthorization(req);
@@ -451,9 +469,10 @@ export function startHttpServer(options: HttpServerOptions = {}) {
     }));
     app.post("/agent/codex/threads/new", route(async (req, res) => {
         const authorization = requestAuthorization(req);
+        const requestedPermissionMode = permissionMode(req.body?.permissionMode);
         if (authorization.session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
         const workspace = workspaceFor(authorization.profile);
-        const thread = await codex.startThread(emitFor(authorization.profile), workspace.workspacePath, permissionMode(req.body?.permissionMode), authorization.profile.key);
+        const thread = await codex.startThread(emitFor(authorization.profile), workspace.workspacePath, requestedPermissionMode, authorization.profile.key);
         const activeThreadId = String((thread as Record<string, unknown>).id || "");
         const nextWorkspace = setActiveThread(authorization.profile, activeThreadId, { emptyThread: true });
         res.json({ ok: true, workspace: nextWorkspace, thread: summarizeCodexThread(thread), messages: [] });
@@ -476,10 +495,11 @@ export function startHttpServer(options: HttpServerOptions = {}) {
     }));
     app.post("/agent/codex/threads/:threadId/resume", route(async (req, res) => {
         const authorization = requestAuthorization(req);
+        const requestedPermissionMode = permissionMode(req.body?.permissionMode);
         if (authorization.session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
         const workspace = workspaceFor(authorization.profile);
         const threadId = routeParam(req.params.threadId);
-        const result = await resumeCodexThread(emitFor(authorization.profile), threadId, workspace.workspacePath, permissionMode(req.body?.permissionMode), authorization.profile.key);
+        const result = await resumeCodexThread(emitFor(authorization.profile), threadId, workspace.workspacePath, requestedPermissionMode, authorization.profile.key);
         const nextWorkspace = setActiveThread(authorization.profile, threadId);
         res.json({ ok: true, workspace: nextWorkspace, ...result });
     }));
@@ -495,6 +515,7 @@ export function startHttpServer(options: HttpServerOptions = {}) {
     app.post("/agent/codex/turn", route(async (req, res) => {
         const authorization = requestAuthorization(req);
         const session = authorization.session;
+        const requestedPermissionMode = permissionMode(req.body?.permissionMode);
         if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
         const attachments = Array.isArray(req.body?.attachments) ? (req.body.attachments as AgentAttachment[]) : [];
         const workspace = workspaceFor(authorization.profile);
@@ -507,7 +528,7 @@ export function startHttpServer(options: HttpServerOptions = {}) {
             let threadId = String(req.body?.threadId || workspace.activeThreadId || "");
             let turnId = "";
             if (!threadId) {
-                const thread = await codex.startThread(emitFor(authorization.profile), workspace.workspacePath, permissionMode(req.body?.permissionMode), authorization.profile.key);
+                const thread = await codex.startThread(emitFor(authorization.profile), workspace.workspacePath, requestedPermissionMode, authorization.profile.key);
                 threadId = String((thread as Record<string, unknown>).id || "");
                 setActiveThread(authorization.profile, threadId, { emptyThread: true });
             } else if (threadId !== workspace.activeThreadId) {
@@ -529,7 +550,7 @@ export function startHttpServer(options: HttpServerOptions = {}) {
                 threadId,
                 cwd: workspace.workspacePath,
                 profileId: authorization.profile.key,
-                permissionMode: permissionMode(req.body?.permissionMode),
+                permissionMode: requestedPermissionMode,
                 appEmit: emitFor(authorization.profile),
                 onStart: clientId ? () => session.bindClient(clientId) : undefined,
                 onThread: (actualThreadId) => {
@@ -562,12 +583,31 @@ export function startHttpServer(options: HttpServerOptions = {}) {
         }
     }));
     app.post("/agent/codex/approval", route(async (req, res) => {
+        const authorization = requestAuthorization(req);
         const decision = String(req.body?.decision || "");
         if (!["accept", "acceptForSession", "decline", "cancel"].includes(decision)) return res.status(400).json({ ok: false, error: "无效的审批决定" });
-        const ok = await resolveCodexApproval(String(req.body?.requestId || ""), decision);
+        const requestId = String(req.body?.requestId || "");
+        if (!requestId) return res.status(400).json({ ok: false, error: "审批请求无效" });
+        const scope = codexControlScope(authorization, req.body);
+        const claimed = authorization.session.claimCodexApproval(requestId, scope);
+        if (!claimed) return res.status(409).json({ ok: false, error: "审批请求已失效" });
+        let resolved = false;
+        try {
+            resolved = await codex.resolveApproval(requestId, decision);
+            authorization.session.finishCodexApproval(requestId, true);
+        } catch (error) {
+            authorization.session.finishCodexApproval(requestId, false);
+            throw error;
+        }
+        const ok = resolved;
         res.status(ok ? 200 : 409).json({ ok, ...(ok ? {} : { error: "审批请求已失效" }) });
     }));
-    app.post("/agent/codex/interrupt", route(async (req, res) => res.json({ ok: await interruptCodexTurn(String(req.body?.threadId || "")) })));
+    app.post("/agent/codex/interrupt", route(async (req, res) => {
+        const authorization = requestAuthorization(req);
+        const active = authorization.session.authorizeCodexInterrupt(codexControlScope(authorization, req.body));
+        const ok = await codex.interruptTurn(active.threadId, authorization.profile.key);
+        res.status(ok ? 200 : 409).json({ ok, ...(ok ? {} : { error: "Codex 任务已结束" }) });
+    }));
     app.post("/agent/claude/turn", (req, res) => {
         runClaudeTurn(String(req.body?.prompt || ""), emitFor(requestAuthorization(req).profile));
         res.json({ ok: true });
@@ -581,8 +621,12 @@ export function startHttpServer(options: HttpServerOptions = {}) {
         const entitlementError = error instanceof EntitlementVerificationError;
         const toolAuthorizationError = error instanceof ToolAuthorizationVerificationError;
         const toolDecisionError = error instanceof CanvasToolDecisionError;
-        const status = providerBlocked ? 403 : apiKeyRequired || invalidInput || entitlementError || toolAuthorizationError || toolDecisionError ? error.statusCode : 500;
-        const code = providerBlocked ? "codex_provider_not_allowed" : apiKeyRequired ? "relay_api_key_required" : entitlementError || toolAuthorizationError || toolDecisionError ? error.code : "";
+        const codexControlError = error instanceof CanvasCodexControlError;
+        const localFileError = error instanceof LocalFileCapabilityError;
+        const fullPermissionError = error instanceof FullPermissionModeError;
+        const typedError = apiKeyRequired || invalidInput || entitlementError || toolAuthorizationError || toolDecisionError || codexControlError || localFileError || fullPermissionError;
+        const status = providerBlocked ? 403 : typedError ? error.statusCode : 500;
+        const code = providerBlocked ? "codex_provider_not_allowed" : apiKeyRequired ? "relay_api_key_required" : entitlementError || toolAuthorizationError || toolDecisionError || codexControlError || localFileError || fullPermissionError ? error.code : "";
         res.status(status).json({ ok: false, ...(code ? { code } : {}), ...((providerBlocked || apiKeyRequired) ? publicCodexConnection(config) : {}), error: error.message });
     });
 
@@ -653,7 +697,8 @@ function routeParam(value: string | string[]) {
 }
 
 function permissionMode(value: unknown): AgentPermissionMode {
-    return value === "automatic" || value === "full" ? value : "request";
+    if (value === "full" || value === "danger-full-access" || value === "dangerFullAccess") throw new FullPermissionModeError();
+    return value === "automatic" ? value : "request";
 }
 
 function headerValue(req: Request, name: string) {
@@ -664,6 +709,20 @@ function headerValue(req: Request, name: string) {
 function authorizedClientId(authorization: RequestAuthorization, requested: string) {
     if (authorization.clientId && requested && authorization.clientId !== requested) throw new Error("invalid client id");
     return authorization.clientId || requested;
+}
+
+function codexControlScope(authorization: RequestAuthorization, body: unknown) {
+    const value = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const requestedClientId = typeof value.clientId === "string" ? value.clientId : "";
+    if (authorization.clientId && requestedClientId && authorization.clientId !== requestedClientId) {
+        throw new CanvasCodexControlError("codex_control_scope_mismatch", "Codex 任务不属于当前网页");
+    }
+    return {
+        profileKey: authorization.profile.key,
+        clientId: authorization.clientId || requestedClientId,
+        ...(typeof value.threadId === "string" && value.threadId ? { threadId: value.threadId } : {}),
+        ...(typeof value.turnId === "string" && value.turnId ? { turnId: value.turnId } : {}),
+    };
 }
 
 function requestHasToolProtocol(req: Request) {

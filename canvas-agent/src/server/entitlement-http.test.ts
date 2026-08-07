@@ -63,6 +63,10 @@ test("website entitlement remains fail-closed across the local HTTP Agent lifecy
         verifiedProfiles: [] as string[],
         stoppedProfiles: [] as string[],
         isolatedEnvironments: [] as Array<Record<string, string | undefined>>,
+        startedPermissionModes: [] as string[],
+        resolvedApprovals: [] as Array<{ requestId: string; decision: string }>,
+        interrupts: [] as Array<{ threadId: string; profileKey: string }>,
+        finishBoundTurn: null as (() => void) | null,
     };
     const agent = startHttpServer({
         silent: true,
@@ -80,14 +84,40 @@ test("website entitlement remains fail-closed across the local HTTP Agent lifecy
                 fakeCodex.stoppedProfiles.push(profileId);
                 return true;
             },
-            startThread: async (_emit, cwd, _permissionMode, profileId) => ({ id: `fake-thread-${profileId}`, cwd: cwd || "" }),
+            startThread: async (_emit, cwd, permissionMode, profileId) => {
+                fakeCodex.startedPermissionModes.push(permissionMode || "request");
+                return { id: `fake-thread-${profileId}`, cwd: cwd || "" };
+            },
             runTurn: async (prompt, _emit, _attachments, options) => {
                 fakeCodex.prompts.push(prompt);
                 const runOptions = options || {};
                 const threadId = runOptions.threadId || "fake-thread";
+                if (prompt.includes("BOUND_CONTROL_TURN")) {
+                    const turnId = "bound-turn";
+                    runOptions.onStart?.();
+                    runOptions.onThread?.(threadId);
+                    runOptions.onTurn?.(turnId);
+                    const localFile = path.join(runOptions.cwd || home, "bound-output.png");
+                    fs.writeFileSync(localFile, "bound-image");
+                    runOptions.appEmit?.("agent_event", { agent: "codex", type: "test.local_file", threadId, turnId, path: localFile });
+                    runOptions.appEmit?.("codex_approval", { requestId: "bound-approval", method: "item/commandExecution/requestApproval", threadId, turnId });
+                    await new Promise<void>((resolve) => (fakeCodex.finishBoundTurn = resolve));
+                    fakeCodex.finishBoundTurn = null;
+                    runOptions.onFinish?.();
+                    return;
+                }
                 runOptions.onThread?.(threadId);
                 runOptions.onTurn?.("fake-turn");
                 runOptions.onFinish?.();
+            },
+            resolveApproval: async (requestId, decision) => {
+                fakeCodex.resolvedApprovals.push({ requestId, decision });
+                return requestId === "bound-approval";
+            },
+            interruptTurn: async (threadId, profileKey) => {
+                fakeCodex.interrupts.push({ threadId: threadId || "", profileKey: profileKey || "" });
+                fakeCodex.finishBoundTurn?.();
+                return true;
             },
         },
     });
@@ -262,6 +292,30 @@ test("website entitlement remains fail-closed across the local HTTP Agent lifecy
         const workspace = await protectedWorkspace(agentUrl, authority.origin, firstTicket, "v1:user:renew-user", "renew-client");
         assert.equal(workspace.status, 200);
 
+        const startsBeforeFullRequest = fakeCodex.startedPermissionModes.length;
+        const promptsBeforeFullRequest = fakeCodex.prompts.length;
+        const forbiddenFullTurn = await fetch(`${agentUrl}/agent/codex/turn`, {
+            method: "POST",
+            headers: agentHeaders(authority.origin, firstTicket, "v1:user:renew-user", "renew-client", true),
+            body: JSON.stringify({ prompt: "must not execute", permissionMode: "full" }),
+        });
+        const forbiddenFullBody = await jsonBody(forbiddenFullTurn);
+        assert.equal(forbiddenFullTurn.status, 403, JSON.stringify(forbiddenFullBody));
+        assert.equal(forbiddenFullBody.code, "full_permission_disabled");
+        assert.equal(fakeCodex.startedPermissionModes.length, startsBeforeFullRequest);
+        assert.equal(fakeCodex.prompts.length, promptsBeforeFullRequest);
+
+        const outsideImage = path.join(home, "outside-workspace.png");
+        fs.writeFileSync(outsideImage, "private-image");
+        const rawPathImage = await fetch(`${agentUrl}/agent/local-image`, {
+            method: "POST",
+            headers: agentHeaders(authority.origin, firstTicket, "v1:user:renew-user", "renew-client", true),
+            body: JSON.stringify({ path: outsideImage }),
+        });
+        const rawPathImageBody = await jsonBody(rawPathImage);
+        assert.equal(rawPathImage.status, 400, JSON.stringify(rawPathImageBody));
+        assert.equal(rawPathImageBody.code, "local_file_handle_invalid");
+
         const websiteRequestsBeforeTurn = authority.requests.length;
         const secretPrompt = "PRIVATE-CODEX-PROMPT-DO-NOT-UPLOAD";
         const turn = await fetch(`${agentUrl}/agent/codex/turn`, {
@@ -284,6 +338,107 @@ test("website entitlement remains fail-closed across the local HTTP Agent lifecy
         assert.equal(wrongClient.status, 401);
         const wrongOrigin = await protectedWorkspace(agentUrl, authority.origin.replace("127.0.0.1", "localhost"), firstTicket, "v1:user:renew-user", "renew-client");
         assert.equal(wrongOrigin.status, 403);
+    });
+
+    await t.test("Codex controls and local file handles stay bound to profile, client, thread, and turn", async () => {
+        const profileId = "v1:user:renew-user";
+        const clientId = "renew-client";
+        const crossProfileId = "v1:user:cross-user";
+        const crossClientId = "cross-client";
+        const crossEntitlement = await authority.issue({ ...ticketInput("cross-user", crossClientId, deviceId, agentVersion), lifetimeSeconds: 120 });
+        const crossPair = await pair(agentUrl, authority.origin, { profileId: crossProfileId, clientId: crossClientId, entitlement: crossEntitlement });
+        const crossConnection = await jsonBody(crossPair);
+        assert.equal(crossPair.status, 200, JSON.stringify(crossConnection));
+        const crossTicket = String(crossConnection.token || "");
+
+        const eventTicketResponse = await fetch(`${agentUrl}/agent/events-ticket`, {
+            method: "POST",
+            headers: agentHeaders(authority.origin, firstTicket, profileId, clientId, true),
+            body: JSON.stringify({ clientId }),
+        });
+        const eventTicketBody = await jsonBody(eventTicketResponse);
+        assert.equal(eventTicketResponse.status, 200, JSON.stringify(eventTicketBody));
+        const eventsResponse = await fetch(`${agentUrl}/events`, {
+            headers: agentHeaders(authority.origin, String(eventTicketBody.ticket || ""), profileId, clientId, false, true),
+        });
+        assert.equal(eventsResponse.status, 200);
+        const events = new SseEventReader(eventsResponse);
+        await events.next("hello");
+
+        try {
+            const turnResponse = await fetch(`${agentUrl}/agent/codex/turn`, {
+                method: "POST",
+                headers: agentHeaders(authority.origin, firstTicket, profileId, clientId, true),
+                body: JSON.stringify({ prompt: "BOUND_CONTROL_TURN" }),
+            });
+            const turnBody = await jsonBody(turnResponse);
+            assert.equal(turnResponse.status, 200, JSON.stringify(turnBody));
+            const threadId = String(turnBody.threadId || "");
+            assert.ok(threadId);
+
+            const localEvent = await events.next("agent_event");
+            const localHandle = String(localEvent.path || "");
+            assert.match(localHandle, /^canvas-agent-file:\/\/local\/lf1_[A-Za-z0-9_-]{43}\//);
+            assert.equal(localHandle.includes(home), false);
+            const approval = await events.next("codex_approval");
+            assert.equal(approval.requestId, "bound-approval");
+            assert.equal(approval.threadId, threadId);
+            assert.equal(approval.turnId, "bound-turn");
+
+            const busyFullTurn = await fetch(`${agentUrl}/agent/codex/turn`, {
+                method: "POST",
+                headers: agentHeaders(authority.origin, firstTicket, profileId, clientId, true),
+                body: JSON.stringify({ prompt: "must not execute while busy", permissionMode: "full" }),
+            });
+            assert.equal(busyFullTurn.status, 403);
+            assert.equal((await jsonBody(busyFullTurn)).code, "full_permission_disabled");
+
+            const crossFile = await fetch(`${agentUrl}/agent/local-image`, {
+                method: "POST",
+                headers: agentHeaders(authority.origin, crossTicket, crossProfileId, crossClientId, true),
+                body: JSON.stringify({ handle: localHandle }),
+            });
+            assert.equal(crossFile.status, 403);
+            assert.equal((await jsonBody(crossFile)).code, "local_file_handle_forbidden");
+            const authorizedFile = await fetch(`${agentUrl}/agent/local-image`, {
+                method: "POST",
+                headers: agentHeaders(authority.origin, firstTicket, profileId, clientId, true),
+                body: JSON.stringify({ handle: localHandle }),
+            });
+            assert.equal(authorizedFile.status, 200);
+            assert.equal(await authorizedFile.text(), "bound-image");
+
+            const crossApproval = await postCodexControl(agentUrl, authority.origin, crossTicket, crossProfileId, crossClientId, "/agent/codex/approval", { requestId: "bound-approval", decision: "accept" });
+            assert.equal(crossApproval.status, 409);
+            const wrongClientApproval = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/approval", { requestId: "bound-approval", decision: "accept", clientId: "other-client" });
+            assert.equal(wrongClientApproval.status, 403);
+            const wrongThreadApproval = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/approval", { requestId: "bound-approval", decision: "accept", threadId: "other-thread" });
+            assert.equal(wrongThreadApproval.status, 403);
+            const wrongTurnApproval = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/approval", { requestId: "bound-approval", decision: "accept", turnId: "other-turn" });
+            assert.equal(wrongTurnApproval.status, 403);
+            assert.equal(fakeCodex.resolvedApprovals.length, 0);
+
+            const accepted = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/approval", { requestId: "bound-approval", decision: "accept", threadId, turnId: "bound-turn" });
+            assert.equal(accepted.status, 200, JSON.stringify(await jsonBody(accepted)));
+            const replay = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/approval", { requestId: "bound-approval", decision: "decline" });
+            assert.equal(replay.status, 409);
+            assert.deepEqual(fakeCodex.resolvedApprovals, [{ requestId: "bound-approval", decision: "accept" }]);
+
+            const crossInterrupt = await postCodexControl(agentUrl, authority.origin, crossTicket, crossProfileId, crossClientId, "/agent/codex/interrupt", { threadId, turnId: "bound-turn" });
+            assert.equal(crossInterrupt.status, 403);
+            const wrongThreadInterrupt = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/interrupt", { threadId: "other-thread", turnId: "bound-turn" });
+            assert.equal(wrongThreadInterrupt.status, 403);
+            const wrongTurnInterrupt = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/interrupt", { threadId, turnId: "other-turn" });
+            assert.equal(wrongTurnInterrupt.status, 403);
+            assert.equal(fakeCodex.interrupts.length, 0);
+
+            const interrupted = await postCodexControl(agentUrl, authority.origin, firstTicket, profileId, clientId, "/agent/codex/interrupt", { threadId, turnId: "bound-turn" });
+            assert.equal(interrupted.status, 200, JSON.stringify(await jsonBody(interrupted)));
+            assert.deepEqual(fakeCodex.interrupts, [{ threadId, profileKey: renewalProfileKey }]);
+        } finally {
+            fakeCodex.finishBoundTurn?.();
+            await events.close();
+        }
     });
 
     await t.test("a signed one-shot permit dispatches its proposal exactly once", async () => {
@@ -541,6 +696,14 @@ function verifyPairingConfirmation(nonce: string, entitlement: string, pairingTi
 
 function protectedWorkspace(agentUrl: string, origin: string, ticket: string, profileId: string, clientId: string) {
     return fetch(`${agentUrl}/agent/codex/workspace`, { headers: agentHeaders(origin, ticket, profileId, clientId) });
+}
+
+function postCodexControl(agentUrl: string, origin: string, ticket: string, profileId: string, clientId: string, route: string, body: Record<string, unknown>) {
+    return fetch(`${agentUrl}${route}`, {
+        method: "POST",
+        headers: agentHeaders(origin, ticket, profileId, clientId, true),
+        body: JSON.stringify(body),
+    });
 }
 
 function agentHeaders(origin: string, ticket: string, profileId: string, clientId: string, json = false, eventTicket = false) {

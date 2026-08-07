@@ -78,7 +78,8 @@ export function verifyAgentTicket(
     if (claims.authorization && claims.authorization.expiresAt < claims.expiresAt) return { ok: false, reason: "invalid" };
     if (expected.origin !== undefined && claims.origin !== expected.origin) return { ok: false, reason: "origin" };
     if (expected.profileKey !== undefined && claims.profileKey !== expected.profileKey) return { ok: false, reason: "profile" };
-    if (expected.clientId !== undefined && claims.clientId && claims.clientId !== expected.clientId) return { ok: false, reason: "client" };
+    // 调用方声明 clientId 时票据必须严格相等；票据为空 clientId 同样拒绝（不匹配任何声明）。
+    if (expected.clientId !== undefined && claims.clientId !== expected.clientId) return { ok: false, reason: "client" };
     return { ok: true, claims };
 }
 

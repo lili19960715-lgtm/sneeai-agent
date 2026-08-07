@@ -24,13 +24,12 @@ test("configured origins remain allowed and invalid tokens cannot pin", () => {
 test("automatic pairing trusts only the official Canvas origins by default", () => {
     assert.equal(authorizeAutomaticPairing("https://sneeai.com"), true);
     assert.equal(authorizeAutomaticPairing("https://www.sneeai.com"), false);
-    for (const origin of ["http://127.0.0.1:3000", "http://localhost:3000", "http://127.0.0.1:3100", "http://localhost:3100"]) {
+    for (const origin of ["http://127.0.0.1:3000", "http://localhost:3000", "http://127.0.0.1:3001", "http://localhost:3001", "http://127.0.0.1:3100", "http://localhost:3100"]) {
         assert.equal(authorizeAutomaticPairing(origin), true, origin);
     }
     assert.equal(authorizeAutomaticPairing("https://evil.example"), false);
     assert.equal(authorizeAutomaticPairing("https://attacker@sneeai.com"), false);
     assert.equal(authorizeAutomaticPairing("https://sneeai.com/path"), false);
-    assert.equal(authorizeAutomaticPairing("http://localhost:3001"), false);
     assert.equal(authorizeAutomaticPairing("http://localhost:3000.evil.example"), false);
     assert.equal(authorizeAutomaticPairing("http://attacker@localhost:3000"), false);
     assert.equal(authorizeAutomaticPairing("http://localhost:3000/path"), false);

@@ -3,7 +3,7 @@ import type { ServerResponse } from "node:http";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CanvasSession, READ_ONLY_TOOL_NAMES, type PendingToolProposal } from "./session.js";
+import { CanvasCodexControlError, CanvasSession, READ_ONLY_TOOL_NAMES, type PendingToolProposal } from "./session.js";
 import { toolInputSchemas } from "./schemas.js";
 
 test("MCP 读取当前激活网页的画布", async (t) => {
@@ -368,6 +368,83 @@ test("new clients receive the current Codex state and later updates", (t) => {
 
     session.setCodexState({ busy: false });
     assert.deepEqual(client.event("codex_state"), { busy: false, threadId: "thread-2", turnId: "turn-1" });
+});
+
+test("Codex approvals are bound to the originating client, thread, and turn", (t) => {
+    const session = new CanvasSession({ profileKey: "profile-a" });
+    const first = connect(session, "first");
+    const second = connect(session, "second");
+    t.after(() => {
+        first.close();
+        second.close();
+    });
+    session.bindClient("first");
+    session.setCodexState({ busy: true, threadId: "thread-a", turnId: "turn-a" });
+    session.emitThread("codex_approval", "thread-a", { requestId: "approval-a", turnId: "turn-a" });
+
+    assert.throws(
+        () => session.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "second" }),
+        (error: unknown) => error instanceof CanvasCodexControlError && error.code === "codex_control_scope_mismatch" && error.statusCode === 403,
+    );
+    assert.throws(
+        () => session.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "first", threadId: "thread-b", turnId: "turn-a" }),
+        (error: unknown) => error instanceof CanvasCodexControlError && error.code === "codex_control_scope_mismatch",
+    );
+    assert.throws(
+        () => session.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "first", threadId: "thread-a", turnId: "turn-b" }),
+        (error: unknown) => error instanceof CanvasCodexControlError && error.code === "codex_control_scope_mismatch",
+    );
+    assert.deepEqual(session.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "first" }), { threadId: "thread-a", turnId: "turn-a" });
+    assert.equal(session.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "first" }), null);
+    session.finishCodexApproval("approval-a", false);
+    assert.deepEqual(session.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "first" }), { threadId: "thread-a", turnId: "turn-a" });
+    session.finishCodexApproval("approval-a", true);
+    assert.equal(session.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "first" }), null);
+});
+
+test("Codex approval identifiers cannot cross profile sessions or survive a turn change", (t) => {
+    const firstProfile = new CanvasSession({ profileKey: "profile-a" });
+    const secondProfile = new CanvasSession({ profileKey: "profile-b" });
+    const first = connect(firstProfile, "shared-client");
+    const second = connect(secondProfile, "shared-client");
+    t.after(() => {
+        first.close();
+        second.close();
+    });
+    firstProfile.bindClient("shared-client");
+    firstProfile.setCodexState({ busy: true, threadId: "thread-a", turnId: "turn-a" });
+    firstProfile.emitThread("codex_approval", "thread-a", { requestId: "approval-a", turnId: "turn-a" });
+
+    assert.equal(secondProfile.claimCodexApproval("approval-a", { profileKey: "profile-b", clientId: "shared-client" }), null);
+    firstProfile.setCodexState({ busy: true, threadId: "thread-a", turnId: "turn-b" });
+    assert.throws(
+        () => firstProfile.claimCodexApproval("approval-a", { profileKey: "profile-a", clientId: "shared-client" }),
+        (error: unknown) => error instanceof CanvasCodexControlError && error.code === "codex_control_scope_mismatch",
+    );
+});
+
+test("Codex interrupt scope requires the bound client and exact active thread and turn", (t) => {
+    const session = new CanvasSession({ profileKey: "profile-a" });
+    const first = connect(session, "first");
+    const second = connect(session, "second");
+    t.after(() => {
+        first.close();
+        second.close();
+    });
+    session.bindClient("first");
+    session.setCodexState({ busy: true, threadId: "thread-a", turnId: "turn-a" });
+
+    for (const scope of [
+        ["second", "thread-a", "turn-a"],
+        ["first", "thread-b", "turn-a"],
+        ["first", "thread-a", "turn-b"],
+    ] as const) {
+        assert.throws(
+            () => session.authorizeCodexInterrupt({ profileKey: "profile-a", clientId: scope[0], threadId: scope[1], turnId: scope[2] }),
+            (error: unknown) => error instanceof CanvasCodexControlError && error.code === "codex_control_scope_mismatch" && error.statusCode === 403,
+        );
+    }
+    assert.deepEqual(session.authorizeCodexInterrupt({ profileKey: "profile-a", clientId: "first", threadId: "thread-a" }), { threadId: "thread-a", turnId: "turn-a" });
 });
 
 test("runtime handoff remains busy until every Codex HTTP operation is released", () => {

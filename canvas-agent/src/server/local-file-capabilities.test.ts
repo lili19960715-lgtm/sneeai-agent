@@ -38,6 +38,20 @@ test("paths outside the workspace and symlink escapes never receive handles", (t
     assert.equal(registry.issue("profile-a", root, path.join(root, "escape.png")), null);
 });
 
+test("hard links cannot import an outside file into the workspace capability boundary", (t) => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-agent-hardlink-"));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const root = path.join(parent, "workspace");
+    const outside = path.join(parent, "private.png");
+    const linked = path.join(root, "linked.png");
+    fs.mkdirSync(root);
+    fs.writeFileSync(outside, "private");
+    fs.linkSync(outside, linked);
+    const registry = new LocalFileCapabilityRegistry();
+
+    assert.equal(registry.issue("profile-a", root, linked), null);
+});
+
 test("payload protection replaces exact and markdown paths without exposing the path", (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-agent-payload-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -65,4 +79,32 @@ test("changing a file invalidates its existing handle", (t) => {
     fs.writeFileSync(filePath, "second");
 
     assert.throws(() => registry.resolve("profile-a", reference), (error: unknown) => error instanceof LocalFileCapabilityError && error.statusCode === 410);
+});
+
+test("changing a file in place invalidates its existing handle", (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-agent-rewrite-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const filePath = path.join(root, "result.png");
+    fs.writeFileSync(filePath, "first");
+    const registry = new LocalFileCapabilityRegistry();
+    const reference = registry.issue("profile-a", root, filePath) || "";
+    fs.writeFileSync(filePath, "replacement-content");
+
+    assert.throws(() => registry.resolve("profile-a", reference), (error: unknown) => error instanceof LocalFileCapabilityError && error.code === "local_file_handle_expired");
+});
+
+test("opened file capabilities keep reading the authorized inode after a path swap", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-agent-open-file-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const filePath = path.join(root, "result.png");
+    const replacement = path.join(root, "replacement.png");
+    fs.writeFileSync(filePath, "authorized-content");
+    fs.writeFileSync(replacement, "replacement-content");
+    const registry = new LocalFileCapabilityRegistry();
+    const reference = registry.issue("profile-a", root, filePath) || "";
+    const opened = await registry.openFile("profile-a", reference);
+    t.after(() => opened.file.close());
+
+    fs.renameSync(replacement, filePath);
+    assert.equal((await opened.file.readFile()).toString(), "authorized-content");
 });

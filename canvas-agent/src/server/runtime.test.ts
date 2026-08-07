@@ -157,8 +157,8 @@ test("profile-bound pairing isolates HTTP workspaces and MCP canvas state", asyn
     t.after(() => stopChild(child));
     await waitForAgent(fixture.url);
 
-    const first = await pairProfile(fixture.url, "account-a");
-    const second = await pairProfile(fixture.url, "account-b");
+    const first = await pairProfile(fixture.url, "account-a", "client-a");
+    const second = await pairProfile(fixture.url, "account-b", "client-b");
     assert.notEqual(first.profileKey, second.profileKey);
     assert.match(first.token, /^cat1\./);
     assert.deepEqual(first.negotiatedCapabilities, [...PROTOCOL_CAPABILITIES]);
@@ -651,12 +651,13 @@ test("MCP refuses an old bridge before posting a tool call", async (t) => {
     assert.equal(toolCalls, 0);
 });
 
-async function pairProfile(url: string, profileId: string) {
+async function pairProfile(url: string, profileId: string, clientId = "") {
     const response = await fetch(`${url}/pair`, {
         method: "POST",
         headers: { origin: DEV_ORIGIN, "content-type": "application/json" },
         body: JSON.stringify({
             profileId,
+            ...(clientId ? { clientId } : {}),
             pairingNonce: crypto.randomBytes(32).toString("base64url"),
             protocolVersion: PROTOCOL_VERSION,
             capabilities: [...PROTOCOL_CAPABILITIES, "client.only.v1"],

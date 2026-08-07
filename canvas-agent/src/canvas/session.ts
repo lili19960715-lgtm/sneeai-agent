@@ -28,7 +28,9 @@ type PendingRequest = {
     reject: (error: Error) => void;
 };
 type TurnAttachment = { clientId: string; id: string; name: string; type: string; size: number; width: number; height: number; dataUrl: string };
+type PendingCodexApproval = { profileKey: string; clientId: string; threadId: string; turnId: string; claimed: boolean };
 export type CodexState = { busy: boolean; threadId: string; turnId: string };
+export type CodexControlScope = { profileKey: string; clientId: string; threadId?: string; turnId?: string };
 export type CanvasClientAuthorization = {
     origin: string;
     profileId: string;
@@ -88,6 +90,13 @@ export class CanvasToolDecisionError extends Error {
     }
 }
 
+export class CanvasCodexControlError extends Error {
+    constructor(readonly code: string, message: string, readonly statusCode = 403) {
+        super(message);
+        this.name = "CanvasCodexControlError";
+    }
+}
+
 /** 管理网页画布连接、状态、附件和工具请求。 */
 export class CanvasSession {
     private clients = new Map<string, ClientConnection>();
@@ -96,6 +105,7 @@ export class CanvasSession {
     private pending = new Map<string, PendingRequest>();
     private canvasStates = new Map<string, CanvasSnapshot>();
     private turnAttachments = new Map<string, TurnAttachment>();
+    private codexApprovals = new Map<string, PendingCodexApproval>();
     private activeClientId = "";
     private boundClientId = "";
     private focusSequence = 0;
@@ -104,7 +114,7 @@ export class CanvasSession {
     private disposed = false;
     private readonly replayGuard: ToolAuthorizationReplayGuard;
 
-    constructor(private readonly options: { now?: () => number; requestTimeoutMs?: number; replayGuard?: ToolAuthorizationReplayGuard } = {}) {
+    constructor(private readonly options: { profileKey?: string; now?: () => number; requestTimeoutMs?: number; replayGuard?: ToolAuthorizationReplayGuard } = {}) {
         this.replayGuard = options.replayGuard || new ToolAuthorizationReplayGuard();
     }
 
@@ -149,8 +159,42 @@ export class CanvasSession {
         const next = { ...this.codexState, ...patch };
         if (next.busy === this.codexState.busy && next.threadId === this.codexState.threadId && next.turnId === this.codexState.turnId) return;
         this.codexState = next;
+        if (!next.busy) this.codexApprovals.clear();
         logger.debug("Codex state changed", this.codexState);
         this.emitAll("codex_state", this.codexState);
+    }
+
+    /** Claim one pending Codex approval only for its exact profile, client, thread, and turn. */
+    claimCodexApproval(requestId: string, scope: CodexControlScope) {
+        const approval = this.codexApprovals.get(requestId);
+        if (!approval || approval.claimed) return null;
+        if (!this.matchesCodexScope(approval, scope)) {
+            throw new CanvasCodexControlError("codex_control_scope_mismatch", "Codex 审批不属于当前网页任务");
+        }
+        approval.claimed = true;
+        return { threadId: approval.threadId, turnId: approval.turnId };
+    }
+
+    /** Complete a claim, or release it when the downstream resolver failed before consuming it. */
+    finishCodexApproval(requestId: string, consumed: boolean) {
+        const approval = this.codexApprovals.get(requestId);
+        if (!approval) return;
+        if (consumed) this.codexApprovals.delete(requestId);
+        else approval.claimed = false;
+    }
+
+    /** Resolve the exact active turn that an authorized client is allowed to interrupt. */
+    authorizeCodexInterrupt(scope: CodexControlScope) {
+        const active = {
+            profileKey: this.options.profileKey || "legacy",
+            clientId: this.boundClientId,
+            threadId: this.codexState.threadId,
+            turnId: this.codexState.turnId,
+        };
+        if (!this.matchesCodexScope(active, scope)) {
+            throw new CanvasCodexControlError("codex_control_scope_mismatch", "Codex 任务不属于当前网页");
+        }
+        return { threadId: active.threadId, turnId: active.turnId };
     }
 
     /** 建立网页与 Sneeai Agent 之间的 SSE 连接。 */
@@ -186,7 +230,10 @@ export class CanvasSession {
             this.clients.delete(clientId);
             this.clientFocusOrder.delete(clientId);
             this.canvasStates.delete(clientId);
-            if (this.boundClientId === clientId) this.boundClientId = "";
+            if (this.boundClientId === clientId) {
+                this.boundClientId = "";
+                this.clearCodexApprovalsForClient(clientId);
+            }
             this.rejectClientPending(clientId, connection.connectionId, "请求页面已断开");
             if (this.activeClientId === clientId) this.activeClientId = [...this.clients.keys()].sort((a, b) => (this.clientFocusOrder.get(b) || 0) - (this.clientFocusOrder.get(a) || 0))[0] || "";
         });
@@ -210,6 +257,7 @@ export class CanvasSession {
         this.clientFocusOrder.clear();
         this.canvasStates.clear();
         this.turnAttachments.clear();
+        this.codexApprovals.clear();
         this.codexOperations = 0;
         this.activeClientId = "";
         this.boundClientId = "";
@@ -241,7 +289,10 @@ export class CanvasSession {
 
     /** 解除当前 Agent turn 的网页绑定。 */
     releaseClient(clientId: string) {
-        if (this.boundClientId === clientId) this.boundClientId = "";
+        if (this.boundClientId === clientId) {
+            this.boundClientId = "";
+            this.clearCodexApprovalsForClient(clientId);
+        }
         logger.debug("Canvas client released from turn", { clientId });
     }
 
@@ -299,7 +350,9 @@ export class CanvasSession {
 
     /** 向全部网页广播带线程归属的事件。 */
     emitThread(type: string, threadId: string, payload: Record<string, unknown> = {}) {
-        this.emitAll(type, { ...payload, threadId });
+        const event = { ...payload, threadId };
+        this.trackCodexApproval(type, event);
+        this.emitAll(type, event);
     }
 
     /** 校验工具参数并将调用分派到当前目标网页。 */
@@ -488,6 +541,51 @@ export class CanvasSession {
     private rejectClientPending(clientId: string, connectionId: string, reason: string) {
         this.pending.forEach((item) => {
             if (item.clientId === clientId && item.connectionId === connectionId) this.failPending(item, new Error(reason));
+        });
+    }
+
+    private trackCodexApproval(type: string, payload: Record<string, unknown>) {
+        const requestId = String(payload.requestId || "");
+        if (type === "codex_approval_resolved") {
+            if (requestId) this.codexApprovals.delete(requestId);
+            return;
+        }
+        if (type !== "codex_approval" || !requestId) return;
+        const approval = {
+            profileKey: this.options.profileKey || "legacy",
+            clientId: this.boundClientId,
+            threadId: String(payload.threadId || this.codexState.threadId || ""),
+            turnId: String(payload.turnId || payload.turn_id || this.codexState.turnId || ""),
+            claimed: false,
+        };
+        if (!this.matchesCodexScope(approval, approval)) {
+            logger.warn("Ignored unbound Codex approval", { requestId, clientId: approval.clientId, threadId: approval.threadId, turnId: approval.turnId });
+            return;
+        }
+        this.codexApprovals.set(requestId, approval);
+    }
+
+    private matchesCodexScope(expected: { profileKey: string; clientId: string; threadId: string; turnId: string }, actual: CodexControlScope) {
+        return Boolean(
+            this.codexState.busy
+            && expected.profileKey
+            && expected.profileKey === (this.options.profileKey || "legacy")
+            && actual.profileKey === expected.profileKey
+            && expected.clientId
+            && this.boundClientId === expected.clientId
+            && actual.clientId === expected.clientId
+            && expected.threadId
+            && this.codexState.threadId === expected.threadId
+            && (!actual.threadId || actual.threadId === expected.threadId)
+            && expected.turnId
+            && this.codexState.turnId === expected.turnId
+            && (!actual.turnId || actual.turnId === expected.turnId)
+        );
+    }
+
+    private clearCodexApprovalsForClient(clientId: string) {
+        this.codexApprovals.forEach((approval, requestId) => {
+            if (approval.clientId === clientId) this.codexApprovals.delete(requestId);
         });
     }
 

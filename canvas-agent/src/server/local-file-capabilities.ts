@@ -17,6 +17,9 @@ type LocalFileCapability = {
     isDirectory: boolean;
     device: number;
     inode: number;
+    links: number;
+    modifiedAt: number;
+    changedAt: number;
 };
 
 export class LocalFileCapabilityError extends Error {
@@ -50,6 +53,7 @@ export class LocalFileCapabilityRegistry {
             filePath = fs.realpathSync(candidatePath);
             if (!pathWithin(root, filePath)) return null;
             file = fs.statSync(filePath);
+            if (file.isFile() && file.nlink !== 1) return null;
         } catch {
             return null;
         }
@@ -66,6 +70,9 @@ export class LocalFileCapabilityRegistry {
             isDirectory: file.isDirectory(),
             device: file.dev,
             inode: file.ino,
+            links: file.nlink,
+            modifiedAt: file.mtimeMs,
+            changedAt: file.ctimeMs,
         });
         return localFileCapabilityURL(handle, path.basename(filePath));
     }
@@ -82,11 +89,53 @@ export class LocalFileCapabilityRegistry {
             const filePath = fs.realpathSync(entry.filePath);
             const file = fs.statSync(filePath);
             if (root !== entry.workspaceRoot || filePath !== entry.filePath || !pathWithin(root, filePath)) throw new Error("path changed");
-            if (entry.device && file.dev !== entry.device || entry.inode && file.ino !== entry.inode) throw new Error("file changed");
+            if (!sameFile(entry, file)) throw new Error("file changed");
             return { ...entry, size: file.size, isDirectory: file.isDirectory() };
         } catch {
             this.entries.delete(handle);
             throw new LocalFileCapabilityError("local_file_handle_expired", "本地文件已变更，请重新运行任务", 410);
+        }
+    }
+
+    /** Open a capability without following a replaced leaf symlink, then verify the opened inode. */
+    async openFile(profileKey: string, reference: string) {
+        const entry = this.resolve(profileKey, reference);
+        if (entry.isDirectory) throw new LocalFileCapabilityError("local_file_not_file", "本地文件授权不是文件", 400);
+        let file: Awaited<ReturnType<typeof fs.promises.open>> | null = null;
+        try {
+            const noFollow = "O_NOFOLLOW" in fs.constants ? fs.constants.O_NOFOLLOW : 0;
+            file = await fs.promises.open(entry.filePath, fs.constants.O_RDONLY | noFollow);
+            const opened = await file.stat();
+            if (!sameFile(entry, opened) || !opened.isFile()) throw new Error("file changed");
+            return { ...entry, size: opened.size, file };
+        } catch {
+            await file?.close().catch(() => undefined);
+            this.entries.delete(entry.handle);
+            throw new LocalFileCapabilityError("local_file_handle_expired", "本地文件已变更，请重新运行任务", 410);
+        }
+    }
+
+    /** Read through the verified descriptor and reject concurrent content changes. */
+    async readFile(profileKey: string, reference: string, maxBytes: number) {
+        const opened = await this.openFile(profileKey, reference);
+        try {
+            if (opened.size > maxBytes) throw new LocalFileCapabilityError("local_file_too_large", "本地文件过大", 413);
+            const chunks: Buffer[] = [];
+            let total = 0;
+            while (total <= maxBytes) {
+                const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+                const { bytesRead } = await opened.file.read(chunk, 0, chunk.length, null);
+                if (!bytesRead) break;
+                chunks.push(chunk.subarray(0, bytesRead));
+                total += bytesRead;
+            }
+            const data = Buffer.concat(chunks, total);
+            const after = await opened.file.stat();
+            if (data.length > maxBytes) throw new LocalFileCapabilityError("local_file_too_large", "本地文件过大", 413);
+            if (!sameFile(opened, after)) throw new LocalFileCapabilityError("local_file_handle_expired", "本地文件已变更，请重新运行任务", 410);
+            return { ...opened, file: undefined, data };
+        } finally {
+            await opened.file.close().catch(() => undefined);
         }
     }
 
@@ -158,4 +207,14 @@ function localPathFromReference(value: string) {
 function pathWithin(root: string, candidate: string) {
     const relative = path.relative(root, candidate);
     return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function sameFile(entry: LocalFileCapability, file: fs.Stats) {
+    return file.dev === entry.device
+        && file.ino === entry.inode
+        && file.nlink === entry.links
+        && file.size === entry.size
+        && file.mtimeMs === entry.modifiedAt
+        && file.ctimeMs === entry.changedAt
+        && file.isDirectory() === entry.isDirectory;
 }
